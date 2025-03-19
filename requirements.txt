@@ -13,3 +13,8 @@ uvicorn
 langchain
 langchain-community
 langchain_google_genai
+sqlalchemy
+psycopg2-binary
+pytesseract
+pdf2image
+Pillow
