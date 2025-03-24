@@ -4,7 +4,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from typing import Optional, Dict, List
 import google.generativeai as genai
-from neo4j import GraphDatabase
 import os
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -32,7 +31,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Initialize FastAPI app
-app = FastAPI(title="Neo4j Gemini Agent API")
+app = FastAPI(title="Document Analysis API")
 
 # Add CORS middleware
 app.add_middleware(
@@ -50,11 +49,6 @@ doc_api = DocumentExtractorAPI()
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 genai.configure(api_key=GOOGLE_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-
-# Neo4j Configuration
-NEO4J_URI = os.getenv('NEO4J_URI', 'bolt://localhost:7687')
-NEO4J_USER = os.getenv('NEO4J_USER', 'neo4j')
-NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD', 'postgres')
 
 # S3 Configuration
 S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME')
@@ -81,95 +75,11 @@ class SearchRequest(BaseModel):
     context: Optional[str] = None
     document_id: str
 
-
-class AgentResponse(BaseModel):
+class SearchResponse(BaseModel):
     query: str
-    cypher_query: str
     results: List[Dict]
     total_results: int
     explanation: Optional[str] = None
-    query_confidence: Optional[float] = None
-    token_counts: Optional[Dict[str, int]] = None
-
-
-class TokenCounter:
-    def __init__(self):
-        self.total_tokens = 0
-        self.prompt_tokens = 0
-        self.completion_tokens = 0
-        
-    def update(self, prompt_tokens: int, completion_tokens: int):
-        self.prompt_tokens += prompt_tokens
-        self.completion_tokens += completion_tokens
-        self.total_tokens = self.prompt_tokens + self.completion_tokens
-        
-    def get_counts(self) -> Dict[str, int]:
-        return {
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "total_tokens": self.total_tokens
-        }
-
-# Initialize token counter
-token_counter = TokenCounter()
-
-# Database dependency
-def get_neo4j_driver():
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        yield driver
-    finally:
-        driver.close()
-
-
-# Schema retrieval function that doesn't rely on APOC
-def get_schema(driver):
-    with driver.session() as session:
-        # Get node labels
-        node_labels_query = """
-        MATCH (n) 
-        WITH DISTINCT labels(n) AS labels
-        UNWIND labels AS label
-        RETURN DISTINCT label
-        """
-        node_labels = [record["label"] for record in session.run(node_labels_query)]
-
-        # Get node properties for each label
-        node_schema = {}
-        for label in node_labels:
-            props_query = f"""
-            MATCH (n:{label})
-            UNWIND keys(n) AS key
-            RETURN DISTINCT key
-            LIMIT 100
-            """
-            properties = [record["key"] for record in session.run(props_query)]
-            node_schema[label] = {"properties": {prop: "unknown" for prop in properties}}
-
-        # Get relationship types
-        rel_query = """
-        MATCH ()-[r]->()
-        RETURN DISTINCT type(r) AS relType
-        """
-        relationship_types = [record["relType"] for record in session.run(rel_query)]
-
-        # Get relationship source and target for each type
-        rel_schema = []
-        for rel_type in relationship_types:
-            source_target_query = f"""
-            MATCH (s)-[r:{rel_type}]->(t)
-            RETURN DISTINCT labels(s)[0] AS sourceLabel, labels(t)[0] AS targetLabel
-            LIMIT 5
-            """
-            for record in session.run(source_target_query):
-                rel_schema.append({
-                    "relType": rel_type,
-                    "sourceLabel": record["sourceLabel"],
-                    "targetLabel": record["targetLabel"]
-                })
-
-        return {"nodes": node_schema, "relationships": rel_schema}
-
 
 @app.post("/process-document")
 async def process_document(file: UploadFile, db: Session = Depends(get_db)):
@@ -203,6 +113,52 @@ async def process_document(file: UploadFile, db: Session = Depends(get_db)):
         logger.error(f"Error processing document: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.delete("/document/{document_id}")
+async def delete_document(document_id: str, db: Session = Depends(get_db)):
+    """Delete a document and its associated data"""
+    try:
+        # Delete from database first
+        invoice_details = db.query(InvoiceDetails).filter(
+            InvoiceDetails.document_id == document_id
+        ).first()
+        
+        if invoice_details:
+            db.delete(invoice_details)
+            db.commit()
+        
+        # Delete from Chroma
+        try:
+            client = chromadb.PersistentClient(
+                path=doc_api.processor.persist_directory,
+                settings=doc_api.processor.chroma_settings
+            )
+            collection = client.get_collection(name=document_id)
+            if collection:
+                client.delete_collection(name=document_id)
+        except Exception as e:
+            logger.error(f"Error deleting Chroma collection: {str(e)}")
+            
+        # Delete from S3
+        try:
+            response = s3_client.list_objects_v2(
+                Bucket=S3_BUCKET_NAME,
+                Prefix=f"documents/{document_id}/"
+            )
+            
+            if 'Contents' in response:
+                for obj in response['Contents']:
+                    s3_client.delete_object(
+                        Bucket=S3_BUCKET_NAME,
+                        Key=obj['Key']
+                    )
+        except Exception as e:
+            logger.error(f"Error deleting S3 objects: {str(e)}")
+            
+        return {"message": "Document and associated data deleted successfully"}
+            
+    except Exception as e:
+        logger.error(f"Error in delete operation: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/documents")
 async def get_documents(db: Session = Depends(get_db)):
@@ -249,7 +205,6 @@ async def get_documents(db: Session = Depends(get_db)):
         logger.error(f"Error listing documents: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/search-graph")
 async def search_graph(request: SearchRequest):
     """Search within a specific document"""
@@ -261,54 +216,6 @@ async def search_graph(request: SearchRequest):
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/document/{document_id}")
-async def delete_document(document_id: str):
-    """Delete a document and its vectors"""
-    try:
-        # Get document info first to get s3_key
-        client = chromadb.PersistentClient(
-            path=doc_api.processor.persist_directory,
-            settings=doc_api.processor.chroma_settings
-        )
-        
-        try:
-            # Get S3 object info before deleting
-            response = s3_client.list_objects_v2(
-                Bucket=S3_BUCKET_NAME,
-                Prefix=f"documents/{document_id}/"
-            )
-            
-            # Delete document using the API
-            doc_api.delete_document(document_id)
-            
-            return {"message": "Document deleted successfully"}
-            
-        except Exception as e:
-            logger.error(f"Error deleting document {document_id}: {str(e)}")
-            raise HTTPException(status_code=404, detail="Document not found")
-
-    except Exception as e:
-        logger.error(f"Error in delete operation: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/schema")
-async def get_database_schema(driver: GraphDatabase.driver = Depends(get_neo4j_driver)):
-    """
-    Get the database schema information
-    """
-    try:
-        schema = get_schema(driver)
-        return JSONResponse(content=schema)
-    except Exception as e:
-        logger.error(f"Error getting schema: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving schema: {str(e)}"
-        )
-
 
 @app.get("/document/{s3_key:path}")
 async def get_document(s3_key: str):
@@ -340,7 +247,6 @@ async def get_document(s3_key: str):
     except Exception as e:
         logger.error(f"Error getting document: {str(e)}")
         raise HTTPException(status_code=404, detail="Document not found")
-
 
 @app.get("/document-info/{document_id}")
 async def get_document_info(document_id: str):
@@ -388,7 +294,6 @@ async def get_document_info(document_id: str):
         logger.error(f"Error fetching document info: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/invoice-details/{document_id}")
 async def get_invoice_details(document_id: str, db: Session = Depends(get_db)):
     """Get invoice details for a document"""
@@ -398,76 +303,95 @@ async def get_invoice_details(document_id: str, db: Session = Depends(get_db)):
         ).first()
         
         if not invoice_details:
-            return {
-                "invoice_number": "N/A",
-                "invoice_date": "N/A",
-                "due_date": "N/A",
-                "biller_company": "N/A",
-                "biller_address": "N/A",
-                "billed_to_company": "N/A",
-                "billed_to_address": "N/A",
-                "total_amount": 0,
-                "currency": "N/A",
-                "payment_terms": "N/A",
-                "items": [],
-                "tax_details": [],
-                "subtotal": 0,
-                "total_tax": 0,
-                "total_amount": 0
-            }
+            return {}
             
-        return {
-            "invoice_number": invoice_details.invoice_number,
-            "invoice_date": invoice_details.invoice_date.strftime('%Y-%m-%d'),
-            "due_date": invoice_details.due_date.strftime('%Y-%m-%d'),  # Fixed date format
-            "biller_company": invoice_details.biller_company,
-            "biller_address": invoice_details.biller_address,
-            "billed_to_company": invoice_details.billed_to_company,
-            "billed_to_address": invoice_details.billed_to_address,
-            "total_amount": float(invoice_details.total_amount),  # Ensure float conversion
-            "currency": invoice_details.currency,
-            "payment_terms": invoice_details.payment_terms,
-            "items": [
-                {
+        # Helper function to check if a value is valid
+        def is_valid(value):
+            if value is None:
+                return False
+            if isinstance(value, str) and value in ['N/A', '']:
+                return False
+            if isinstance(value, (int, float)) and value == 0:
+                return False
+            return True
+
+        # Build response with only valid fields
+        response = {}
+        
+        # Add basic fields if they are valid
+        fields = {
+            'invoice_number': invoice_details.invoice_number,
+            'biller_company': invoice_details.biller_company,
+            'biller_address': invoice_details.biller_address,
+            'recipient_name': invoice_details.recipient_name,
+            'recipient_address': invoice_details.recipient_address,
+            'payment_terms': invoice_details.payment_terms,
+            'currency': invoice_details.currency
+        }
+        
+        for key, value in fields.items():
+            if is_valid(value):
+                response[key] = value
+
+        # Add date fields if they are valid (not default date)
+        if invoice_details.invoice_date and invoice_details.invoice_date.year != 2000:
+            response['invoice_date'] = invoice_details.invoice_date.strftime('%Y-%m-%d')
+            
+        if invoice_details.due_date and invoice_details.due_date.year != 2000:
+            response['due_date'] = invoice_details.due_date.strftime('%Y-%m-%d')
+
+        # Add amount fields if they are valid
+        if is_valid(invoice_details.subtotal):
+            response['subtotal'] = float(invoice_details.subtotal)
+            
+        if is_valid(invoice_details.total_tax):
+            response['total_tax'] = float(invoice_details.total_tax)
+            
+        if is_valid(invoice_details.total_amount):
+            response['total_amount'] = float(invoice_details.total_amount)
+
+        # Add items if they exist and have valid data
+        valid_items = [
+            {
+                key: value
+                for key, value in {
                     "item_name": item.item_name,
                     "quantity": item.quantity,
                     "unit_price": item.unit_price,
                     "total_price": item.total_price,
                     "description": item.description
-                } for item in invoice_details.items
-            ],
-            "tax_details": [
-                {
+                }.items()
+                if is_valid(value)
+            }
+            for item in invoice_details.items
+        ]
+        
+        if valid_items:
+            response['items'] = [item for item in valid_items if item]  # Only include items with data
+
+        # Add tax details if they exist and have valid data
+        valid_tax_details = [
+            {
+                key: value
+                for key, value in {
                     "tax_type": tax.tax_type,
                     "tax_rate": tax.tax_rate,
                     "tax_amount": tax.tax_amount,
                     "description": tax.description
-                } for tax in invoice_details.tax_details
-            ],
-            "subtotal": float(invoice_details.subtotal),
-            "total_tax": float(invoice_details.total_tax),
-            "total_amount": float(invoice_details.total_amount)
-        }
+                }.items()
+                if is_valid(value)
+            }
+            for tax in invoice_details.tax_details
+        ]
+        
+        if valid_tax_details:
+            response['tax_details'] = [tax for tax in valid_tax_details if tax]  # Only include tax details with data
+
+        return response
+        
     except Exception as e:
         logger.error(f"Error fetching invoice details: {str(e)}")
-        return {
-            "invoice_number": "Error",
-            "invoice_date": "N/A",
-            "due_date": "N/A",
-            "biller_company": "N/A",
-            "biller_address": "N/A",
-            "billed_to_company": "N/A",
-            "billed_to_address": "N/A",
-            "total_amount": 0,
-            "currency": "N/A",
-            "payment_terms": "N/A",
-            "items": [],
-            "tax_details": [],
-            "subtotal": 0,
-            "total_tax": 0,
-            "total_amount": 0
-        }
-
+        return {}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

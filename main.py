@@ -18,10 +18,11 @@ from models import InvoiceDetails, get_db, InvoiceItem, TaxDetails
 from datetime import datetime
 import re
 from sqlalchemy.orm import Session
-import pytesseract
-from PIL import Image
 import pdf2image
-import io
+from PIL import Image
+import base64
+from io import BytesIO
+from fastapi import HTTPException
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -69,135 +70,73 @@ class DocumentProcessor:
             is_persistent=True
         )
 
-    def extract_invoice_details(self, text: str, file_path: str = None) -> dict:
+    def _encode_image_to_base64(self, image):
+        """Convert PIL Image to base64 string"""
+        buffered = BytesIO()
+        image.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        return img_str
+
+    def extract_invoice_details(self, image_or_text, is_image=False):
         """Extract key details from invoice using Gemini"""
-        try:
-            # For both PDFs and images, use direct image processing
-            if file_path:
-                # For PDFs, process first page
-                if file_path.lower().endswith('.pdf'):
-                    pages = pdf2image.convert_from_path(file_path)
-                    if pages:
-                        # Convert first page to bytes
-                        img_byte_arr = io.BytesIO()
-                        pages[0].save(img_byte_arr, format='PNG')
-                        image_data = img_byte_arr.getvalue()
-                else:
-                    # For images, read directly
-                    with open(file_path, 'rb') as img_file:
-                        image_data = img_file.read()
-
-                prompt = """
-                You are a precise invoice data extractor. Analyze this invoice image carefully and extract the following information.
-                Look for these specific elements:
-
-                1. Invoice Number: Usually labeled as "Invoice #", "Invoice Number", or similar
-                2. Dates: Look for "Invoice Date", "Due Date", "Issue Date" - ensure YYYY-MM-DD format
-                3. Companies: 
-                    - Biller: The company issuing the invoice (look for logo, header, or "From" section)
-                    - Recipient: The company being billed (look for "Bill To", "To", or similar)
-                4. Addresses: Complete addresses for both companies
-                5. Line Items: Look for itemized list of products/services
-                6. Tax Information: Look for VAT, GST, or other tax-related entries
-                7. Payment Terms: Look for "Terms", "Payment Terms", or similar
-                8. Amounts: Pay special attention to:
-                    - Individual item prices and quantities
-                    - Subtotal
-                    - Tax amounts
-                    - Total amount
-                9. Currency: Look for currency symbols or codes
-
-                Return the data in this exact JSON format:
+        prompt = """
+        Extract the following information from this invoice. If a field is not found, return "N/A" for text and 0 for numbers.
+        Return the response in this exact JSON format:
+        {
+            "invoice_number": "value",
+            "invoice_date": "YYYY-MM-DD",
+            "due_date": "YYYY-MM-DD",
+            "biller_company": "value",
+            "biller_address": "complete address",
+            "recipient_name": "name of person or company being billed",
+            "recipient_address": "complete billing address",
+            "items": [
                 {
-                    "invoice_number": "exact number as shown",
-                    "invoice_date": "YYYY-MM-DD",
-                    "due_date": "YYYY-MM-DD",
-                    "biller_company": "complete company name",
-                    "biller_address": "complete address",
-                    "billed_to_company": "complete company name",
-                    "billed_to_address": "complete address",
-                    "items": [
-                        {
-                            "item_name": "exact item name",
-                            "quantity": number,
-                            "unit_price": number,
-                            "total_price": number,
-                            "description": "any additional details"
-                        }
-                    ],
-                    "tax_details": [
-                        {
-                            "tax_type": "exact tax type (GST/VAT/etc)",
-                            "tax_rate": number,
-                            "tax_amount": number,
-                            "description": "any tax-related notes"
-                        }
-                    ],
-                    "subtotal": number,
-                    "total_tax": number,
-                    "total_amount": number,
-                    "currency": "USD/EUR/etc",
-                    "payment_terms": "exact payment terms"
+                    "item_name": "name",
+                    "quantity": number,
+                    "unit_price": number,
+                    "total_price": number,
+                    "description": "description if any"
                 }
-
-                Important:
-                - Extract EXACT values as shown in the invoice
-                - Maintain precise number formatting
-                - Use "N/A" for missing text fields
-                - Use 0 for missing numerical values
-                - Ensure dates are in YYYY-MM-DD format
-                - Include ALL found line items
-                - Include ALL tax details
-                """
-
-                # Process with Gemini
-                response = self.gemini_model.generate_content([
-                    prompt,
-                    {"mime_type": "image/png", "data": image_data}
-                ])
+            ],
+            "tax_details": [
+                {
+                    "tax_type": "GST/VAT/etc",
+                    "tax_rate": number,
+                    "tax_amount": number,
+                    "description": "description if any"
+                }
+            ],
+            "subtotal": number,
+            "total_tax": number,
+            "total_amount": number,
+            "currency": "USD/EUR/etc",
+            "payment_terms": "value"
+        }
+        """
+        
+        try:
+            if is_image:
+                response = self.gemini_model.generate_content([prompt, image_or_text])
             else:
-                # Fallback to text-based processing if no file path
-                prompt = f"""
-                Extract the following information from this invoice text.
-                Be extremely precise and thorough.
+                response = self.gemini_model.generate_content(f"{prompt}\n\nInvoice text:\n{image_or_text}")
 
-                Text content:
-                {text}
-                """
-            response = self.gemini_model.generate_content(prompt)
-
-            # Clean and parse the response
+            # Clean the response text to ensure valid JSON
             cleaned_text = response.text.strip()
             if cleaned_text.startswith("```json"):
-                cleaned_text = cleaned_text[7:-3]
+                cleaned_text = cleaned_text[7:-3]  # Remove ```json and ``` markers
+            details = json.loads(cleaned_text)
             
-            # Try to fix common JSON formatting issues
-            cleaned_text = cleaned_text.replace("'", '"')
-            cleaned_text = re.sub(r'(\d+)\.?0+([,\s}])', r'\1\2', cleaned_text)
-            
-            try:
-                details = json.loads(cleaned_text)
-            except json.JSONDecodeError as e:
-                print(f"JSON parsing error: {str(e)}")
-                print(f"Problematic text: {cleaned_text}")
-                raise
-
             # Validate and clean the data
             items = details.get('items', [])
             if not items:
                 items = [{
                     "item_name": "Unknown Item",
-                    "quantity": 1,
-                    "unit_price": float(details.get('total_amount', 0)),
-                    "total_price": float(details.get('total_amount', 0)),
+                    "quantity": details.get('total_amount', 0),
+                    "unit_price": details.get('total_amount', 0),
+                    "total_price": details.get('total_amount', 0),
                     "description": "N/A"
                 }]
-
-            # Ensure all numerical values are properly converted
-            for item in items:
-                item['quantity'] = float(item.get('quantity', 0))
-                item['unit_price'] = float(item.get('unit_price', 0))
-                item['total_price'] = float(item.get('total_price', 0))
 
             tax_details = details.get('tax_details', [])
             if not tax_details:
@@ -208,34 +147,14 @@ class DocumentProcessor:
                     "description": "N/A"
                 }]
 
-            # Ensure all tax values are properly converted
-            for tax in tax_details:
-                tax['tax_rate'] = float(tax.get('tax_rate', 0))
-                tax['tax_amount'] = float(tax.get('tax_amount', 0))
-
-            # Format dates properly
-            invoice_date = details.get('invoice_date', '2000-01-01')
-            due_date = details.get('due_date', '2000-01-01')
-            
-            # Validate dates
-            try:
-                datetime.strptime(invoice_date, '%Y-%m-%d')
-            except ValueError:
-                invoice_date = '2000-01-01'
-            
-            try:
-                datetime.strptime(due_date, '%Y-%m-%d')
-            except ValueError:
-                due_date = '2000-01-01'
-
             return {
                 "invoice_number": str(details.get('invoice_number', 'N/A')),
-                "invoice_date": invoice_date,
-                "due_date": due_date,
+                "invoice_date": details.get('invoice_date', '2000-01-01'),
+                "due_date": details.get('due_date', '2000-01-01'),
                 "biller_company": str(details.get('biller_company', 'N/A')),
                 "biller_address": str(details.get('biller_address', 'N/A')),
-                "billed_to_company": str(details.get('billed_to_company', 'N/A')),
-                "billed_to_address": str(details.get('billed_to_address', 'N/A')),
+                "recipient_name": str(details.get('recipient_name', 'N/A')),
+                "recipient_address": str(details.get('recipient_address', 'N/A')),
                 "items": items,
                 "tax_details": tax_details,
                 "subtotal": float(details.get('subtotal', 0)),
@@ -252,8 +171,8 @@ class DocumentProcessor:
                 "due_date": "2000-01-01",
                 "biller_company": "N/A",
                 "biller_address": "N/A",
-                "billed_to_company": "N/A",
-                "billed_to_address": "N/A",
+                "recipient_name": "N/A",
+                "recipient_address": "N/A",
                 "items": [],
                 "tax_details": [],
                 "subtotal": 0,
@@ -266,19 +185,30 @@ class DocumentProcessor:
     def save_invoice_details(self, document_id: str, details: dict, db: Session):
         """Save invoice details to database"""
         try:
+            # Parse dates with fallback to default date if 'N/A'
+            def parse_date(date_str):
+                if date_str == 'N/A' or not date_str:
+                    return datetime(2000, 1, 1)  # Default date
+                try:
+                    return datetime.strptime(date_str, '%Y-%m-%d')
+                except ValueError:
+                    return datetime(2000, 1, 1)  # Default date on parse error
+
             invoice_details = InvoiceDetails(
                 document_id=document_id,
                 generated_name=details.get('generated_name'),
                 invoice_number=details.get('invoice_number', 'N/A'),
-                invoice_date=datetime.strptime(details.get('invoice_date', '2000-01-01'), '%Y-%m-%d'),
-                due_date=datetime.strptime(details.get('due_date', '2000-01-01'), '%Y-%m-%d'),
+                invoice_date=parse_date(details.get('invoice_date')),
+                due_date=parse_date(details.get('due_date')),
                 biller_company=details.get('biller_company', 'N/A'),
                 biller_address=details.get('biller_address', 'N/A'),
-                billed_to_company=details.get('billed_to_company', 'N/A'),
-                billed_to_address=details.get('billed_to_address', 'N/A'),
+                recipient_name=details.get('recipient_name', 'N/A'),
+                recipient_address=details.get('recipient_address', 'N/A'),
                 subtotal=details.get('subtotal', 0),
                 total_tax=details.get('total_tax', 0),
-                total_amount=details.get('total_amount', 0)
+                total_amount=details.get('total_amount', 0),
+                currency=details.get('currency', 'USD'),
+                payment_terms=details.get('payment_terms', 'N/A')
             )
             
             # Add items
@@ -306,26 +236,29 @@ class DocumentProcessor:
 
             db.add(invoice_details)
             db.commit()
+            return invoice_details
             
         except Exception as e:
             db.rollback()
             print(f"Error saving invoice details: {str(e)}")
+            raise
 
-    def generate_document_name(self, text: str) -> str:
+    def generate_document_name(self, image_or_text, is_image=False):
         """Generate a descriptive name for the document using Gemini"""
-        prompt = f"""
+        prompt = """
         Generate a concise but descriptive filename for this invoice document.
         The filename should follow this format: "<BillerCompany>_Invoice_<InvoiceNumber>_<Date>".
         If any part is not found, use a reasonable alternative.
         Keep it under 50 characters and use only alphanumeric characters, underscores, and hyphens.
         Do not include file extension.
-
-        Invoice text:
-        {text}
         """
         
         try:
-            response = self.gemini_model.generate_content(prompt)
+            if is_image:
+                response = self.gemini_model.generate_content([prompt, image_or_text])
+            else:
+                response = self.gemini_model.generate_content(f"{prompt}\n\nInvoice text:\n{image_or_text}")
+
             name = response.text.strip()
             # Clean the filename
             name = re.sub(r'[^\w\-_]', '_', name)  # Replace invalid chars with underscore
@@ -337,86 +270,106 @@ class DocumentProcessor:
             return f"Invoice_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     def _extract_text_from_file(self, file_path: str) -> str:
-        """Extract text from PDF or image file using only Gemini"""
+        """Extract text from PDF or image file using Gemini vision"""
         file_ext = os.path.splitext(file_path.lower())[1]
         
         try:
             if file_ext == '.pdf':
-                # For PDFs, first convert to images
+                # Convert PDF to images
                 pages = pdf2image.convert_from_path(file_path)
-                all_text = []
+                if not pages:
+                    raise ValueError("No pages found in PDF")
                 
-                # Process each page as an image using Gemini
+                full_text = ""
+                
+                # Process each page with Gemini
                 for page in pages:
-                    # Convert page to bytes
-                    img_byte_arr = io.BytesIO()
-                    page.save(img_byte_arr, format='PNG')
-                    img_byte_arr = img_byte_arr.getvalue()
-                    
-                    # Process with Gemini
+                    # Use Gemini to extract text
                     prompt = """
-                    Extract all text content from this invoice image.
-                    Include all text, numbers, dates, and details you can see.
-                    Maintain the original structure and formatting as much as possible.
+                    Extract all text from this image, preserving the exact formatting and numbers.
+                    Include ALL text visible in the image, even if it seems unimportant.
+                    Do not summarize or skip any text.
                     """
+                    response = self.gemini_model.generate_content([prompt, page])
                     
-                    response = self.gemini_model.generate_content([
-                        prompt,
-                        {"mime_type": "image/png", "data": img_byte_arr}
-                    ])
+                    if not response.text:
+                        raise ValueError(f"Gemini returned empty text for page")
                     
-                    if response.text:
-                        all_text.append(response.text)
+                    full_text += response.text + "\n\n"
                 
-                return "\n\n".join(all_text)
+                if not full_text.strip():
+                    raise ValueError("No text extracted from PDF")
+                
+                return full_text
             else:
-                # For images, use Gemini directly
-                with open(file_path, 'rb') as img_file:
-                    image_data = img_file.read()
+                # Process single image
+                image = Image.open(file_path)
+                # Ensure the image is valid
+                image.verify()
+                # Reopen after verify
+                image = Image.open(file_path)
                 
+                # Use Gemini to extract text
                 prompt = """
-                Extract all text content from this invoice image.
-                Include all text, numbers, dates, and details you can see.
-                Maintain the original structure and formatting as much as possible.
+                Extract all text from this image, preserving the exact formatting and numbers.
+                Include ALL text visible in the image, even if it seems unimportant.
+                Do not summarize or skip any text.
                 """
+                response = self.gemini_model.generate_content([prompt, image])
                 
-                response = self.gemini_model.generate_content([
-                    prompt,
-                    {"mime_type": "image/jpeg", "data": image_data}
-                ])
+                if not response.text:
+                    raise ValueError("Gemini returned empty text for image")
                 
-                return response.text if response.text else "No text could be extracted from the image"
+                return response.text
                 
         except Exception as e:
-            print(f"Error in text extraction: {str(e)}")
-            return "Error extracting text from document"
+            print(f"Error extracting text from file: {str(e)}")
+            raise ValueError(f"Failed to extract text: {str(e)}")
 
     def process_document(self, file_path: str, file_name: str, db: Session) -> Dict:
         """Process a document and store its chunks in Chroma"""
         try:
-            # Extract text from file (PDF or image)
+            # Load the image/PDF for Gemini vision processing
+            file_ext = os.path.splitext(file_path.lower())[1]
+            is_image = file_ext != '.pdf'
+            
+            if is_image:
+                image = Image.open(file_path)
+                # Verify image is valid
+                image.verify()
+                # Reopen after verify
+                image = Image.open(file_path)
+            
+            # Generate document ID
+            document_id = str(uuid.uuid4())
+            
+            # Extract text using Gemini vision
             text = self._extract_text_from_file(file_path)
             
-            if not text or text.isspace():
-                raise Exception("No text could be extracted from the document")
+            if not text.strip():
+                raise ValueError("No text could be extracted from the document")
+            
+            # Generate document name using Gemini vision
+            if is_image:
+                generated_name = self.generate_document_name(image, is_image=True)
+            else:
+                generated_name = self.generate_document_name(text)
+            
+            # Extract invoice details using Gemini vision
+            if is_image:
+                invoice_details = self.extract_invoice_details(image, is_image=True)
+            else:
+                invoice_details = self.extract_invoice_details(text)
+            
+            if invoice_details:
+                invoice_details['generated_name'] = generated_name
+                self.save_invoice_details(document_id, invoice_details, db)
             
             # Split text into chunks
             texts = self.text_splitter.split_text(text)
             
             if not texts:
-                texts = [text]  # Use the entire text as one chunk if splitting fails
-            
-            # Generate document ID
-            document_id = str(uuid.uuid4())
-            
-            # Generate document name
-            generated_name = self.generate_document_name(text)
-            
-            # Extract and save invoice details with generated name
-            invoice_details = self.extract_invoice_details(text, file_path)
-            if invoice_details:
-                invoice_details['generated_name'] = generated_name
-                self.save_invoice_details(document_id, invoice_details, db)
+                raise ValueError("Text splitting resulted in no chunks")
             
             # Create documents with metadata
             documents = [
@@ -429,11 +382,7 @@ class DocumentProcessor:
                         "page_number": i // 2 + 1
                     }
                 ) for i, chunk in enumerate(texts)
-                if chunk and not chunk.isspace()  # Only include non-empty chunks
             ]
-            
-            if not documents:
-                raise Exception("No valid text chunks could be created")
             
             # Create Chroma collection for this document
             vectorstore = Chroma(
@@ -451,17 +400,20 @@ class DocumentProcessor:
             s3_key = f"documents/{document_id}/{file_name}"
             with open(file_path, 'rb') as file:
                 s3_client.upload_fileobj(file, S3_BUCKET_NAME, s3_key)
-                
-                return {
-                    "document_id": document_id,
+            
+            return {
+                "document_id": document_id,
                 "s3_key": s3_key,
                 "name": file_name,
                 "num_chunks": len(texts)
             }
             
+        except ValueError as e:
+            print(f"Validation error in process_document: {str(e)}")
+            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             print(f"Error in process_document: {str(e)}")
-            raise Exception(f"Error processing document: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
 
     def search_document(self, document_id: str, query: str) -> Dict:
         """Search within a specific document"""
@@ -558,7 +510,7 @@ class DocumentProcessor:
                         Bucket=S3_BUCKET_NAME,
                         Key=obj['Key']
                     )
-            
+                    
         except Exception as e:
             raise Exception(f"Error deleting document: {str(e)}")
 
