@@ -285,7 +285,7 @@ export default function DocumentAnalysis() {
                   {invoiceDetails.total_amount && (
                     <div className="flex justify-between text-lg font-medium mt-4 pt-4 border-t border-red-200">
                       <span>Total Amount:</span>
-                      <span>{invoiceDetails.currency} {invoiceDetails.total_amount.toFixed(2)}</span>
+                      <span>{invoiceDetails.currency} {typeof invoiceDetails.total_amount === 'number' ? invoiceDetails.total_amount.toFixed(2) : ''}</span>
                     </div>
                   )}
                 </div>
@@ -319,10 +319,10 @@ export default function DocumentAnalysis() {
                             {item.quantity}
                           </td>
                           <td className="px-6 py-4 whitespace-nowrap text-right text-sm text-gray-900">
-                            {invoiceDetails.currency} {item.unit_price.toFixed(2)}
+                            {typeof item.unit_price === 'number' ? `${invoiceDetails.currency} ${item.unit_price.toFixed(2)}` : ''}
                           </td>
                           <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium text-gray-900">
-                            {invoiceDetails.currency} {item.total_price.toFixed(2)}
+                            {typeof item.total_price === 'number' ? `${invoiceDetails.currency} ${item.total_price.toFixed(2)}` : ''}
                           </td>
                         </tr>
                       ))}
@@ -332,7 +332,7 @@ export default function DocumentAnalysis() {
                         <tr>
                           <td colSpan={3} className="px-6 py-3 text-right text-sm font-medium text-red-800">Subtotal</td>
                           <td className="px-6 py-3 text-right text-sm font-medium text-red-800">
-                            {invoiceDetails.currency} {invoiceDetails.subtotal.toFixed(2)}
+                            {typeof invoiceDetails.subtotal === 'number' ? `${invoiceDetails.currency} ${invoiceDetails.subtotal.toFixed(2)}` : ''}
                           </td>
                         </tr>
                       </tfoot>
@@ -357,7 +357,7 @@ export default function DocumentAnalysis() {
                         <div className="flex justify-between items-center text-sm">
                           <span className="text-red-600">Amount</span>
                           <span className="text-red-800 font-medium">
-                            {invoiceDetails.currency} {tax.tax_amount.toFixed(2)}
+                            {typeof tax.tax_amount === 'number' ? `${invoiceDetails.currency} ${tax.tax_amount.toFixed(2)}` : ''}
                           </span>
                         </div>
                       )}
@@ -378,7 +378,7 @@ export default function DocumentAnalysis() {
                     <div className="flex justify-between w-64">
                       <span className="text-gray-600">Subtotal</span>
                       <span className="text-gray-900 font-medium">
-                        {invoiceDetails.currency} {invoiceDetails.subtotal.toFixed(2)}
+                        {typeof invoiceDetails.subtotal === 'number' ? `${invoiceDetails.currency} ${invoiceDetails.subtotal.toFixed(2)}` : ''}
                       </span>
                     </div>
                   )}
@@ -386,7 +386,7 @@ export default function DocumentAnalysis() {
                     <div className="flex justify-between w-64">
                       <span className="text-gray-600">Total Tax</span>
                       <span className="text-gray-900 font-medium">
-                        {invoiceDetails.currency} {invoiceDetails.total_tax.toFixed(2)}
+                        {typeof invoiceDetails.total_tax === 'number' ? `${invoiceDetails.currency} ${invoiceDetails.total_tax.toFixed(2)}` : ''}
                       </span>
                     </div>
                   )}
@@ -394,7 +394,7 @@ export default function DocumentAnalysis() {
                     <div className="flex justify-between w-64 pt-2 border-t border-gray-200">
                       <span className="text-lg font-semibold text-gray-800">Total</span>
                       <span className="text-lg font-bold text-red-600">
-                        {invoiceDetails.currency} {invoiceDetails.total_amount.toFixed(2)}
+                        {typeof invoiceDetails.total_amount === 'number' ? `${invoiceDetails.currency} ${invoiceDetails.total_amount.toFixed(2)}` : ''}
                       </span>
                     </div>
                   )}
