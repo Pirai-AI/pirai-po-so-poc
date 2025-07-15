@@ -1,10 +1,9 @@
 from fastapi import FastAPI, UploadFile, Request, Depends, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from typing import Optional, Dict, List
 import google.generativeai as genai
-from neo4j import GraphDatabase
 import os
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -13,6 +12,13 @@ import logging
 from langchain_community.callbacks.manager import get_openai_callback
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+import io
+from urllib.parse import unquote
+import boto3
+import tempfile
+import chromadb
+from models import get_db, InvoiceDetails
+from sqlalchemy.orm import Session
 
 # Import the DocumentExtractorAPI from main.py
 from main import DocumentExtractorAPI
@@ -25,7 +31,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Initialize FastAPI app
-app = FastAPI(title="Neo4j Gemini Agent API")
+app = FastAPI(title="Document Analysis API")
 
 # Add CORS middleware
 app.add_middleware(
@@ -42,396 +48,356 @@ doc_api = DocumentExtractorAPI()
 # Initialize Gemini
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 genai.configure(api_key=GOOGLE_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+gemini_model = genai.GenerativeModel('gemini-2.0-flash')
 
-# Neo4j Configuration
-NEO4J_URI = os.getenv('NEO4J_URI', 'bolt://localhost:7687')
-NEO4J_USER = os.getenv('NEO4J_USER', 'neo4j')
-NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD', 'postgres')
+# S3 Configuration
+S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME')
 
+# Add after S3_BUCKET_NAME declaration
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+    region_name=os.getenv('AWS_REGION')
+)
+
+# Test S3 connection at startup
+try:
+    s3_client.list_objects_v2(Bucket=S3_BUCKET_NAME, MaxKeys=1)
+    logger.info("Successfully connected to S3")
+except Exception as e:
+    logger.error(f"Failed to connect to S3: {str(e)}")
 
 # Pydantic models
 class SearchRequest(BaseModel):
     query: str
     params: Optional[Dict] = None
     context: Optional[str] = None
+    document_id: str
 
-
-class AgentResponse(BaseModel):
+class SearchResponse(BaseModel):
     query: str
-    cypher_query: str
     results: List[Dict]
     total_results: int
     explanation: Optional[str] = None
-    query_confidence: Optional[float] = None
-    token_counts: Optional[Dict[str, int]] = None
 
-
-class TokenCounter:
-    def __init__(self):
-        self.total_tokens = 0
-        self.prompt_tokens = 0
-        self.completion_tokens = 0
-        
-    def update(self, prompt_tokens: int, completion_tokens: int):
-        self.prompt_tokens += prompt_tokens
-        self.completion_tokens += completion_tokens
-        self.total_tokens = self.prompt_tokens + self.completion_tokens
-        
-    def get_counts(self) -> Dict[str, int]:
-        return {
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "total_tokens": self.total_tokens
-        }
-
-# Initialize token counter
-token_counter = TokenCounter()
-
-# Database dependency
-def get_neo4j_driver():
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+@app.post("/posoapi/process-document")
+async def process_document(file: UploadFile, db: Session = Depends(get_db)):
+    """Process and store a new document"""
     try:
-        yield driver
-    finally:
-        driver.close()
+        # Check file extension
+        allowed_extensions = {'.pdf', '.jpg', '.jpeg', '.png'}
+        file_ext = os.path.splitext(file.filename.lower())[1]
+        
+        if file_ext not in allowed_extensions:
+            raise HTTPException(
+                status_code=400,
+                detail="Only PDF and image files (JPG, JPEG, PNG) are supported"
+            )
 
-
-# Schema retrieval function that doesn't rely on APOC
-def get_schema(driver):
-    with driver.session() as session:
-        # Get node labels
-        node_labels_query = """
-        MATCH (n) 
-        WITH DISTINCT labels(n) AS labels
-        UNWIND labels AS label
-        RETURN DISTINCT label
-        """
-        node_labels = [record["label"] for record in session.run(node_labels_query)]
-
-        # Get node properties for each label
-        node_schema = {}
-        for label in node_labels:
-            props_query = f"""
-            MATCH (n:{label})
-            UNWIND keys(n) AS key
-            RETURN DISTINCT key
-            LIMIT 100
-            """
-            properties = [record["key"] for record in session.run(props_query)]
-            node_schema[label] = {"properties": {prop: "unknown" for prop in properties}}
-
-        # Get relationship types
-        rel_query = """
-        MATCH ()-[r]->()
-        RETURN DISTINCT type(r) AS relType
-        """
-        relationship_types = [record["relType"] for record in session.run(rel_query)]
-
-        # Get relationship source and target for each type
-        rel_schema = []
-        for rel_type in relationship_types:
-            source_target_query = f"""
-            MATCH (s)-[r:{rel_type}]->(t)
-            RETURN DISTINCT labels(s)[0] AS sourceLabel, labels(t)[0] AS targetLabel
-            LIMIT 5
-            """
-            for record in session.run(source_target_query):
-                rel_schema.append({
-                    "relType": rel_type,
-                    "sourceLabel": record["sourceLabel"],
-                    "targetLabel": record["targetLabel"]
-                })
-
-        return {"nodes": node_schema, "relationships": rel_schema}
-
-
-@app.post("/process-document")
-async def process_document(file: UploadFile):
-    """
-    Endpoint to process a document and create knowledge graph
-    """
-    try:
-        # Save the uploaded file temporarily
-        temp_path = f"temp_{file.filename}"
-        with open(temp_path, "wb") as buffer:
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
             content = await file.read()
-            buffer.write(content)
+            tmp.write(content)
+            tmp_path = tmp.name
 
-        # Process the document
-        result = doc_api.process_input(temp_path, "pdf")
-
-        # Clean up temporary file
-        os.remove(temp_path)
-
-        return JSONResponse(content=result)
-
+        try:
+            # Process document with db session
+            result = doc_api.process_document(tmp_path, db)
+            os.unlink(tmp_path)
+            return result
+        except Exception as e:
+            os.unlink(tmp_path)
+            raise e
     except Exception as e:
         logger.error(f"Error processing document: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.post("/search-graph", response_model=AgentResponse)
-async def search_graph(
-        request: SearchRequest,
-        driver: GraphDatabase.driver = Depends(get_neo4j_driver)
-):
-    """
-    AI Agent endpoint to search the knowledge graph using natural language query
-    Input:
-    - query: Natural language query
-    - params: Optional parameters to inject into the query
-    - context: Optional context for the agent
-    """
+@app.delete("/posoapi/document/{document_id}")
+async def delete_document(document_id: str, db: Session = Depends(get_db)):
+    """Delete a document and its associated data"""
     try:
-        # Get schema information for better context
-        schema = get_schema(driver)
-        schema_str = json.dumps(schema, indent=2)
-
-        # Log the retrieved schema information
-        logger.info("Retrieved schema information")
-
-        # Initialize LangChain Gemini chat model
-        chat_model = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GOOGLE_API_KEY)
-
-        # Build prompt
-        prompt = f"""
-        You are a Neo4j query agent that converts natural language to Cypher.
-
-        # Database Schema:
-        ```json
-        {schema_str}
-        ```
-
-        # User Context:
-        {request.context or "No additional context provided."}
-
-        # Guidelines for Query Generation:
-        1. Analyze the natural language query and identify the entities, relationships, and conditions
-        2. Map these to the actual node labels, relationship types, and properties in the schema
-        3. Construct a valid Cypher query that correctly represents the user's intent
-        4. For date queries, remember that dates are stored as strings in 'YYYY-MM-DD' or 'Month DD, YYYY' format
-        5. Include appropriate RETURN clauses to provide comprehensive results
-        6. Use parameters for values where appropriate
-        7. Include appropriate sorting, filtering, and pagination where relevant
-        8. Return related entities for better context
-        9. IMPORTANT: When returning properties from nodes, always return them directly (e.g., `n.property`) and NOT as maps/objects
-        10. NEVER return objects or maps - always return primitive types (strings, numbers) directly
-
-        # Your Task:
-        - Generate a valid Cypher query for: "{request.query}"
-        - Provide a brief explanation of how the query works
-        - Rate your confidence in the query from 0.0 to 1.0
-
-        Format your response as JSON:
-        {{
-            "cypher_query": "YOUR CYPHER QUERY HERE",
-            "explanation": "Brief explanation of the query",
-            "confidence": 0.95
-        }}
-        """
-
-        # Create messages
-        messages = [HumanMessage(content=prompt)]
-
-        # Get response and count tokens
-        response = chat_model.invoke(messages)
-        response_text = response.content.strip()
-
-        # Update token counter (estimated for Gemini since exact counts aren't available)
-        # Using rough estimation: 1 token ≈ 4 characters
-        prompt_tokens = len(prompt) // 4
-        completion_tokens = len(response_text) // 4
-        token_counter.update(prompt_tokens, completion_tokens)
-
-        # Extract JSON from response
+        # Delete from database first
+        invoice_details = db.query(InvoiceDetails).filter(
+            InvoiceDetails.document_id == document_id
+        ).first()
+        
+        if invoice_details:
+            db.delete(invoice_details)
+            db.commit()
+        
+        # Delete from Chroma
         try:
-            # Try to parse directly
-            agent_response = json.loads(response_text)
-        except json.JSONDecodeError:
-            # If direct parsing fails, try to extract JSON block
+            client = chromadb.PersistentClient(
+                path=doc_api.processor.persist_directory,
+                settings=doc_api.processor.chroma_settings
+            )
+            collection = client.get_collection(name=document_id)
+            if collection:
+                client.delete_collection(name=document_id)
+        except Exception as e:
+            logger.error(f"Error deleting Chroma collection: {str(e)}")
+            
+        # Delete from S3
+        try:
+            response = s3_client.list_objects_v2(
+                Bucket=S3_BUCKET_NAME,
+                Prefix=f"documents/{document_id}/"
+            )
+            
+            if 'Contents' in response:
+                for obj in response['Contents']:
+                    s3_client.delete_object(
+                        Bucket=S3_BUCKET_NAME,
+                        Key=obj['Key']
+                    )
+        except Exception as e:
+            logger.error(f"Error deleting S3 objects: {str(e)}")
+            
+        return {"message": "Document and associated data deleted successfully"}
+            
+    except Exception as e:
+        logger.error(f"Error in delete operation: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/posoapi/documents")
+async def get_documents(db: Session = Depends(get_db)):
+    """Get list of all documents"""
+    try:
+        # Get all collections
+        client = chromadb.PersistentClient(
+            path=doc_api.processor.persist_directory,
+            settings=doc_api.processor.chroma_settings
+        )
+        
+        # Get collection names - handle both string and Collection objects
+        collections = client.list_collections()
+        documents = []
+        
+        for collection in collections:
+            # Extract collection name - handle both string and Collection objects
+            collection_name = collection.name if hasattr(collection, 'name') else str(collection)
+            
+            # Get invoice details for generated name
+            invoice_details = db.query(InvoiceDetails).filter(
+                InvoiceDetails.document_id == collection_name
+            ).first()
+            
+            # Get S3 object info
+            response = s3_client.list_objects_v2(
+                Bucket=S3_BUCKET_NAME,
+                Prefix=f"documents/{collection_name}/"
+            )
+            
+            if 'Contents' in response:
+                s3_key = response['Contents'][0]['Key']
+                original_name = s3_key.split('/')[-1]
+                
+                documents.append({
+                    "id": collection_name,
+                    "name": invoice_details.generated_name if invoice_details else original_name,
+                    "original_name": original_name,
+                    "s3_key": s3_key
+                })
+        
+        # Sort documents by name
+        documents.sort(key=lambda x: x["name"].lower())
+        return documents
+        
+    except Exception as e:
+        logger.error(f"Error listing documents: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/posoapi/search-graph")
+async def search_graph(request: SearchRequest):
+    """Search within a specific document"""
+    try:
+        result = doc_api.search_document(
+            document_id=request.document_id,
+            query=request.query
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/posoapi/document/{s3_key:path}")
+async def get_document(s3_key: str):
+    """Get document file from S3"""
+    try:
+        # Get the file from S3
+        response = s3_client.get_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key
+        )
+        
+        # Determine media type based on file extension
+        file_ext = s3_key.lower().split('.')[-1]
+        media_type = {
+            'pdf': 'application/pdf',
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg',
+            'png': 'image/png'
+        }.get(file_ext, 'application/octet-stream')
+        
+        # Return the file as a streaming response
+        return StreamingResponse(
+            response['Body'].iter_chunks(),
+            media_type=media_type,
+            headers={
+                'Content-Disposition': f'inline; filename="{s3_key.split("/")[-1]}"'
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error getting document: {str(e)}")
+        raise HTTPException(status_code=404, detail="Document not found")
+
+@app.get("/posoapi/document-info/{document_id}")
+async def get_document_info(document_id: str):
+    """Get document information"""
+    try:
+        # Get Chroma client
+        client = chromadb.PersistentClient(
+            path=doc_api.processor.persist_directory,
+            settings=doc_api.processor.chroma_settings
+        )
+        
+        try:
+            # Get invoice details for the generated name
+            db = next(get_db())
+            invoice_details = db.query(InvoiceDetails).filter(
+                InvoiceDetails.document_id == document_id
+            ).first()
+            
+            # Just check if collection exists - don't need to store the result
             try:
-                if "```json" in response_text:
-                    json_part = response_text.split("```json")[1].split("```")[0].strip()
-                elif "```" in response_text:
-                    json_part = response_text.split("```")[1].split("```")[0].strip()
-                else:
-                    # Try to find JSON-like content
-                    start_idx = response_text.find('{')
-                    end_idx = response_text.rfind('}') + 1
-                    if start_idx >= 0 and end_idx > start_idx:
-                        json_part = response_text[start_idx:end_idx]
-                    else:
-                        raise ValueError("Could not extract JSON from response")
-
-                agent_response = json.loads(json_part)
-            except Exception as json_ex:
-                logger.error(f"Failed to parse Gemini response: {str(json_ex)}")
-                # Fallback to a default structure
-                agent_response = {
-                    "cypher_query": "Could not generate valid Cypher query",
-                    "explanation": "Failed to parse the model response",
-                    "confidence": 0.0
+                client.get_collection(name=document_id)
+            except:
+                raise HTTPException(status_code=404, detail="Document not found in ChromaDB")
+            
+            # Get S3 object info
+            response = s3_client.list_objects_v2(
+                Bucket=S3_BUCKET_NAME,
+                Prefix=f"documents/{document_id}/"
+            )
+            
+            if 'Contents' in response:
+                s3_key = response['Contents'][0]['Key']
+                original_name = s3_key.split('/')[-1]
+                return {
+                    "id": document_id,
+                    "name": invoice_details.generated_name if invoice_details else original_name,
+                    "original_name": original_name,
+                    "s3_key": s3_key
                 }
-
-        # Add token counts to the response
-        agent_response['token_counts'] = token_counter.get_counts()
-
-        cypher_query = agent_response.get("cypher_query", "")
-        explanation = agent_response.get("explanation", "")
-        confidence = agent_response.get("confidence", 0.5)
-
-        logger.info(f"Generated Cypher query with confidence {confidence}")
-
-        # Replace parameters if provided
-        if request.params:
-            # For simple parameter replacement in string
-            for param, value in request.params.items():
-                param_placeholder = f"${param}"
-                if isinstance(value, str):
-                    cypher_query = cypher_query.replace(param_placeholder, f"'{value}'")
-                else:
-                    cypher_query = cypher_query.replace(param_placeholder, str(value))
-
-        # Execute the Cypher query
-        try:
-            logger.info(f"Executing Cypher query: {cypher_query}")
-            with driver.session() as session:
-                result = session.run(cypher_query, request.params or {})
-                records = [dict(record) for record in result]
-
-                # Convert Neo4j types to JSON-serializable types
-                processed_records = process_neo4j_results(records)
-
-                return AgentResponse(
-                    query=request.query,
-                    cypher_query=cypher_query,
-                    results=processed_records,
-                    total_results=len(processed_records),
-                    explanation=explanation,
-                    query_confidence=confidence,
-                    token_counts=token_counter.get_counts()
-                )
-
-        except Exception as db_error:
-            logger.error(f"Database error executing query: {str(db_error)}")
-            # Generate a fallback query if possible
-            fallback_query = generate_fallback_query(request.query, schema)
-
-            with driver.session() as session:
-                result = session.run(fallback_query)
-                records = [dict(record) for record in result]
-                processed_records = process_neo4j_results(records)
-
-                return AgentResponse(
-                    query=request.query,
-                    cypher_query=fallback_query,
-                    results=processed_records,
-                    total_results=len(processed_records),
-                    explanation=f"Original query failed with error: {str(db_error)}. Used fallback query.",
-                    query_confidence=0.3,
-                    token_counts=token_counter.get_counts()
-                )
-
+            else:
+                raise HTTPException(status_code=404, detail="Document not found in S3")
+                
+        except Exception as e:
+            logger.error(f"Error getting collection {document_id}: {str(e)}")
+            raise HTTPException(status_code=404, detail="Document not found")
+            
     except Exception as e:
-        logger.error(f"General error in search_graph: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error in AI agent: {str(e)}"
-        )
+        logger.error(f"Error fetching document info: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-def process_neo4j_results(records):
-    """Process Neo4j results to make them JSON serializable"""
-    processed_records = []
-    for record in records:
-        processed_record = {}
-        for key, value in record.items():
-            # Directly serialize the value without creating nested structures
-            processed_record[key] = serialize_neo4j_value(value, flatten=True)
-        processed_records.append(processed_record)
-    return processed_records
-
-
-def serialize_neo4j_value(value, flatten=False):
-    """
-    Serialize a Neo4j value to a JSON-compatible format
-    Args:
-        value: The value to serialize
-        flatten: If True, flattens node and relationship properties into primitive values
-    """
-    if hasattr(value, 'items') and callable(value.items):  # Neo4j Node or Relationship
-        if flatten:
-            # For nodes and relationships, just return their properties as primitive values
-            return {k: serialize_neo4j_value(v, flatten=True) for k, v in value.items()}
-        else:
-            # Only serialize the properties
-            properties = {}
-            for k, v in value.items():
-                properties[k] = serialize_neo4j_value(v, flatten=True)
-            return properties
-    elif isinstance(value, list):
-        return [serialize_neo4j_value(item, flatten=True) for item in value]
-    elif isinstance(value, dict):
-        # For dict, process each key-value pair
-        return {k: serialize_neo4j_value(v, flatten=True) for k, v in value.items()}
-    elif isinstance(value, (int, float, bool, str, type(None))):
-        # Primitive types are fine
-        return value
-    else:
-        # Convert anything else to string
-        return str(value)
-
-
-def generate_fallback_query(query, schema):
-    """Generate a fallback query when the main query fails"""
-    # Find the main node labels from schema
-    node_labels = list(schema["nodes"].keys())
-
-    if not node_labels:
-        # If no schema available, use a very basic query
-        return "MATCH (n) RETURN n.id as id LIMIT 10"
-
-    # Use the first node label as the primary one for the query
-    primary_label = node_labels[0]
-
-    # Get properties for this label
-    properties = schema["nodes"].get(primary_label, {}).get("properties", {})
-    prop_names = list(properties.keys())
-
-    if not prop_names:
-        return f"MATCH (n:{primary_label}) RETURN id(n) as id LIMIT 10"
-
-    # Select some common properties to return, avoid returning objects
-    select_props = prop_names[:3]  # Take first 3 properties
-
-    # Build a basic query returning primitive properties only
-    select_clause = ", ".join([f'n.{p} as {p}' for p in select_props])
-    return f"""
-    MATCH (n:{primary_label})
-    RETURN {select_clause}
-    LIMIT 20
-    """
-
-
-@app.get("/schema")
-async def get_database_schema(driver: GraphDatabase.driver = Depends(get_neo4j_driver)):
-    """
-    Get the database schema information
-    """
+@app.get("/posoapi/invoice-details/{document_id}")
+async def get_invoice_details(document_id: str, db: Session = Depends(get_db)):
+    """Get invoice details for a document"""
     try:
-        schema = get_schema(driver)
-        return JSONResponse(content=schema)
-    except Exception as e:
-        logger.error(f"Error getting schema: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving schema: {str(e)}"
-        )
+        invoice_details = db.query(InvoiceDetails).filter(
+            InvoiceDetails.document_id == document_id
+        ).first()
+        
+        if not invoice_details:
+            return {}
+            
+        # Helper function to check if a value is valid
+        def is_valid(value):
+            if value is None:
+                return False
+            if isinstance(value, str) and value in ['N/A', '']:
+                return False
+            if isinstance(value, (int, float)) and value == 0:
+                return False
+            return True
 
+        # Build response with only valid fields
+        response = {}
+        
+        # Add basic fields if they are valid
+        fields = {
+            'invoice_number': invoice_details.invoice_number,
+            'biller_company': invoice_details.biller_company,
+            'biller_address': invoice_details.biller_address,
+            'recipient_name': invoice_details.recipient_name,
+            'recipient_address': invoice_details.recipient_address,
+            'payment_terms': invoice_details.payment_terms,
+            'currency': invoice_details.currency
+        }
+        
+        for key, value in fields.items():
+            if is_valid(value):
+                response[key] = value
+
+        # Add date fields if they are valid (not default date)
+        if invoice_details.invoice_date and invoice_details.invoice_date.year != 2000:
+            response['invoice_date'] = invoice_details.invoice_date.strftime('%Y-%m-%d')
+            
+        if invoice_details.due_date and invoice_details.due_date.year != 2000:
+            response['due_date'] = invoice_details.due_date.strftime('%Y-%m-%d')
+
+        # Add amount fields if they are valid
+        if is_valid(invoice_details.subtotal):
+            response['subtotal'] = float(invoice_details.subtotal)
+            
+        if is_valid(invoice_details.total_tax):
+            response['total_tax'] = float(invoice_details.total_tax)
+            
+        if is_valid(invoice_details.total_amount):
+            response['total_amount'] = float(invoice_details.total_amount)
+
+        # Add items if they exist and have valid data
+        valid_items = [
+            {
+                key: value
+                for key, value in {
+                    "item_name": item.item_name,
+                    "quantity": item.quantity,
+                    "unit_price": item.unit_price,
+                    "total_price": item.total_price,
+                    "description": item.description
+                }.items()
+                if is_valid(value)
+            }
+            for item in invoice_details.items
+        ]
+        
+        if valid_items:
+            response['items'] = [item for item in valid_items if item]  # Only include items with data
+
+        # Add tax details if they exist and have valid data
+        valid_tax_details = [
+            {
+                key: value
+                for key, value in {
+                    "tax_type": tax.tax_type,
+                    "tax_rate": tax.tax_rate,
+                    "tax_amount": tax.tax_amount,
+                    "description": tax.description
+                }.items()
+                if is_valid(value)
+            }
+            for tax in invoice_details.tax_details
+        ]
+        
+        if valid_tax_details:
+            response['tax_details'] = [tax for tax in valid_tax_details if tax]  # Only include tax details with data
+
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error fetching invoice details: {str(e)}")
+        return {}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

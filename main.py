@@ -2,41 +2,43 @@ import os
 import json
 import boto3
 from dotenv import load_dotenv
-from neo4j import GraphDatabase
-from sentence_transformers import SentenceTransformer
+from langchain_community.vectorstores import Chroma
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 import google.generativeai as genai
-from typing import Dict, List, Union, Optional, Any
+from typing import Dict, List, Union, Optional
 import fitz  # PyMuPDF
-import re
 import uuid
 import warnings
 import tempfile
+from langchain_core.documents import Document
+import chromadb
+from chromadb.config import Settings
+from models import InvoiceDetails, get_db, InvoiceItem, TaxDetails
+from datetime import datetime
+import re
+from sqlalchemy.orm import Session
+import pdf2image
+from PIL import Image
+import base64
+from io import BytesIO
+from fastapi import HTTPException
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
 
 # Load environment variables
 load_dotenv()
 
-# AWS S3 Configuration
+# Configuration
 S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME')
 AWS_REGION = os.getenv('AWS_REGION')
 AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
-
-# Google Gemini API Key
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+
+# Initialize Gemini
 genai.configure(api_key=GOOGLE_API_KEY)
-
-# Neo4j Configuration
-NEO4J_URI = os.getenv('NEO4J_URI', 'bolt://localhost:7687')
-NEO4J_USER = os.getenv('NEO4J_USER', 'neo4j')
-NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD', 'postgres')
-
-# Initialize sentence transformer model
-model_name = "all-MiniLM-L6-v2"  # Can be customized based on requirements
-embedding_model = SentenceTransformer(model_name)
 
 # Initialize S3 client
 s3_client = boto3.client(
@@ -46,530 +48,488 @@ s3_client = boto3.client(
     region_name=AWS_REGION
 )
 
-# Initialize Neo4j driver
-neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-
-class DynamicDocumentExtractor:
+class DocumentProcessor:
     def __init__(self):
-        self.gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+        self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+        self.embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/embedding-001",
+            google_api_key=GOOGLE_API_KEY
+        )
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len,
+        )
+        self.persist_directory = "chroma_db"
+        os.makedirs(self.persist_directory, exist_ok=True)
         
-    def preprocess_document(self, input_data: Union[str, bytes], input_type: str) -> str:
-        """
-        Preprocess the document based on input type (text, pdf)
-        Returns extracted text
-        """
-        if input_type == 'text':
-            return input_data
-        
-        elif input_type == 'pdf':
-            try:
-                # Input data should be the local path to PDF file
-                pdf_path = input_data
-                text = ""
-                with fitz.open(pdf_path) as doc:
-                    for page in doc:
-                        text += page.get_text()
-                return text
-            except Exception as e:
-                return ""
-        else:
-            return ""
+        # Configure Chroma settings
+        self.chroma_settings = Settings(
+            anonymized_telemetry=False,
+            allow_reset=True,
+            is_persistent=True
+        )
 
-    def generate_embeddings(self, text: str) -> List[float]:
-        """Generate embeddings for text using SentenceTransformer"""
-        try:
-            return embedding_model.encode(text).tolist()
-        except Exception as e:
-            return []
+    def _encode_image_to_base64(self, image):
+        """Convert PIL Image to base64 string"""
+        buffered = BytesIO()
+        image.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        return img_str
 
-    def identify_document_type(self, text: str) -> Dict:
-        """Use Gemini to identify document type and key structure"""
-        prompt = f"""
-        Analyze the following document text and determine its type and structure.
-        Identify what kind of document this is (e.g., purchase order, sales order, invoice, contract, etc.)
-        and what primary entities and data points are contained within it.
-        
-        For each entity or data point, identify:
-        1. The entity/data point name
-        2. The type of information it contains
-        3. Its relationships to other entities if applicable
-        
-        Document Text:
-        {text[:4000]}  # Limit text length for API
-        
-        Provide your analysis in this JSON format:
-        {{
-            "document_type": "identified document type",
-            "entities": [
-                {{
-                    "name": "entity name",
-                    "type": "entity type",
-                    "attributes": ["attribute1", "attribute2"],
-                    "relationships": [
-                        {{"related_to": "other entity name", "relationship_type": "type of relationship"}}
-                    ]
-                }}
+    def extract_invoice_details(self, image_or_text, is_image=False):
+        """Extract key details from invoice using Gemini"""
+        prompt = """
+        Extract the following information from this invoice. If a field is not found, return "N/A" for text and 0 for numbers.
+        Return the response in this exact JSON format:
+        {
+            "invoice_number": "value",
+            "invoice_date": "YYYY-MM-DD",
+            "due_date": "YYYY-MM-DD",
+            "biller_company": "value",
+            "biller_address": "complete address",
+            "recipient_name": "name of person or company being billed",
+            "recipient_address": "complete billing address",
+            "items": [
+                {
+                    "item_name": "name",
+                    "quantity": number,
+                    "unit_price": number,
+                    "total_price": number,
+                    "description": "description if any"
+                }
             ],
-            "primary_identifiers": ["key1", "key2"]
-        }}
+            "tax_details": [
+                {
+                    "tax_type": "GST/VAT/etc",
+                    "tax_rate": number,
+                    "tax_amount": number,
+                    "description": "description if any"
+                }
+            ],
+            "subtotal": number,
+            "total_tax": number,
+            "total_amount": number,
+            "currency": "USD/EUR/etc",
+            "payment_terms": "value"
+        }
         """
         
         try:
-            response = self.gemini_model.generate_content(prompt)
-            # Extract JSON from the response
-            json_text = response.text
-            if '```json' in json_text:
-                json_text = json_text.split('```json')[1].split('```')[0].strip()
-            elif '```' in json_text:
-                json_text = json_text.split('```')[1].split('```')[0].strip()
-            return json.loads(json_text)
-        except Exception as e:
-            return {"document_type": "unknown", "entities": [], "primary_identifiers": []}
+            if is_image:
+                response = self.gemini_model.generate_content([prompt, image_or_text])
+            else:
+                response = self.gemini_model.generate_content(f"{prompt}\n\nInvoice text:\n{image_or_text}")
 
-    def extract_structured_information(self, text: str, document_schema: Dict) -> Dict:
-        """Extract structured information based on document schema"""
-        # Create a detailed prompt based on the document schema
-        entities_description = "\n".join([
-            f"- {entity['name']}: {entity['type']} with attributes {', '.join(entity['attributes'])}"
-            for entity in document_schema.get('entities', [])
-        ])
-        
-        prompt = f"""
-        Given the following document text and schema, extract all relevant information according to the schema structure.
-        
-        Document Type: {document_schema.get('document_type', 'unknown')}
-        
-        Primary Identifiers: {', '.join(document_schema.get('primary_identifiers', []))}
-        
-        Entities to Extract:
-        {entities_description}
-        
-        Document Text:
-        {text[:6000]}  # Limit text length for API
-        
-        Extract all information matching the schema above and provide a complete JSON output with all identified entities,
-        their attributes, and values. Use null for missing values. Convert all monetary values to numbers, dates to ISO format,
-        and ensure consistent formatting. For lists of items, extract all items found in the document.
-        """
-        
-        try:
-            response = self.gemini_model.generate_content(prompt)
-            # Extract JSON from the response
-            json_text = response.text
-            if '```json' in json_text:
-                json_text = json_text.split('```json')[1].split('```')[0].strip()
-            elif '```' in json_text:
-                json_text = json_text.split('```')[1].split('```')[0].strip()
+            # Clean the response text to ensure valid JSON
+            cleaned_text = response.text.strip()
+            if cleaned_text.startswith("```json"):
+                cleaned_text = cleaned_text[7:-3]  # Remove ```json and ``` markers
+            details = json.loads(cleaned_text)
             
-            extracted_data = json.loads(json_text)
-            # Add document_type from schema
-            extracted_data['document_type'] = document_schema.get('document_type', 'unknown')
-            return extracted_data
+            # Validate and clean the data
+            items = details.get('items', [])
+            if not items:
+                items = [{
+                    "item_name": "Unknown Item",
+                    "quantity": details.get('total_amount', 0),
+                    "unit_price": details.get('total_amount', 0),
+                    "total_price": details.get('total_amount', 0),
+                    "description": "N/A"
+                }]
+
+            tax_details = details.get('tax_details', [])
+            if not tax_details:
+                tax_details = [{
+                    "tax_type": "N/A",
+                    "tax_rate": 0,
+                    "tax_amount": 0,
+                    "description": "N/A"
+                }]
+
+            return {
+                "invoice_number": str(details.get('invoice_number', 'N/A')),
+                "invoice_date": details.get('invoice_date', '2000-01-01'),
+                "due_date": details.get('due_date', '2000-01-01'),
+                "biller_company": str(details.get('biller_company', 'N/A')),
+                "biller_address": str(details.get('biller_address', 'N/A')),
+                "recipient_name": str(details.get('recipient_name', 'N/A')),
+                "recipient_address": str(details.get('recipient_address', 'N/A')),
+                "items": items,
+                "tax_details": tax_details,
+                "subtotal": float(details.get('subtotal', 0)),
+                "total_tax": float(details.get('total_tax', 0)),
+                "total_amount": float(details.get('total_amount', 0)),
+                "currency": str(details.get('currency', 'USD')),
+                "payment_terms": str(details.get('payment_terms', 'N/A'))
+            }
         except Exception as e:
-            return {"document_type": document_schema.get('document_type', 'unknown'), "error": str(e)}
+            print(f"Error extracting invoice details: {str(e)}")
+            return {
+                "invoice_number": "N/A",
+                "invoice_date": "2000-01-01",
+                "due_date": "2000-01-01",
+                "biller_company": "N/A",
+                "biller_address": "N/A",
+                "recipient_name": "N/A",
+                "recipient_address": "N/A",
+                "items": [],
+                "tax_details": [],
+                "subtotal": 0,
+                "total_tax": 0,
+                "total_amount": 0,
+                "currency": "USD",
+                "payment_terms": "N/A"
+            }
 
-    def normalize_value(self, value: Any) -> Any:
-        """Normalize values for consistent storage in Neo4j"""
-        if isinstance(value, str):
-            # Try to convert string numbers to float
-            if re.match(r'^\$?[\d,]+(\.\d+)?$', value.strip()):
+    def save_invoice_details(self, document_id: str, details: dict, db: Session):
+        """Save invoice details to database"""
+        try:
+            # Parse dates with fallback to default date if 'N/A'
+            def parse_date(date_str):
+                if date_str == 'N/A' or not date_str:
+                    return datetime(2000, 1, 1)  # Default date
                 try:
-                    return float(value.strip().replace('$', '').replace(',', ''))
-                except:
-                    pass
-            # Try to normalize dates (basic implementation)
-            if re.match(r'^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$', value.strip()):
-                return value.strip()
-        return value
+                    return datetime.strptime(date_str, '%Y-%m-%d')
+                except ValueError:
+                    return datetime(2000, 1, 1)  # Default date on parse error
 
-    def create_dynamic_knowledge_graph(self, document_id: str, extracted_data: Dict, document_schema: Dict) -> None:
-        """Create knowledge graph from dynamically extracted data using Neo4j"""
-        with neo4j_driver.session() as session:
-            # Create Document node
-            session.run(
-                """
-                CREATE (d:Document {id: $document_id, type: $document_type})
-                """,
+            invoice_details = InvoiceDetails(
                 document_id=document_id,
-                document_type=extracted_data.get('document_type', 'unknown')
+                generated_name=details.get('generated_name'),
+                invoice_number=details.get('invoice_number', 'N/A'),
+                invoice_date=parse_date(details.get('invoice_date')),
+                due_date=parse_date(details.get('due_date')),
+                biller_company=details.get('biller_company', 'N/A'),
+                biller_address=details.get('biller_address', 'N/A'),
+                recipient_name=details.get('recipient_name', 'N/A'),
+                recipient_address=details.get('recipient_address', 'N/A'),
+                subtotal=details.get('subtotal', 0),
+                total_tax=details.get('total_tax', 0),
+                total_amount=details.get('total_amount', 0),
+                currency=details.get('currency', 'USD'),
+                payment_terms=details.get('payment_terms', 'N/A')
             )
             
-            # Process all entities based on dynamic schema
-            for entity_schema in document_schema.get('entities', []):
-                entity_name = entity_schema['name']
-                entity_type = entity_schema['type']
-                
-                # Check if entity exists in extracted data
-                if entity_name in extracted_data:
-                    entity_data = extracted_data[entity_name]
-                    
-                    # Handle list of entities
-                    if isinstance(entity_data, list):
-                        for i, item in enumerate(entity_data):
-                            self._create_entity_node(session, document_id, entity_type, item, f"{entity_name}_{i}")
-                    else:
-                        # Handle single entity
-                        self._create_entity_node(session, document_id, entity_type, entity_data, entity_name)
+            # Add items
+            for item in details.get('items', []):
+                invoice_item = InvoiceItem(
+                    document_id=document_id,
+                    item_name=item.get('item_name', 'N/A'),
+                    quantity=float(item.get('quantity', 0)),
+                    unit_price=float(item.get('unit_price', 0)),
+                    total_price=float(item.get('total_price', 0)),
+                    description=item.get('description', 'N/A')
+                )
+                invoice_details.items.append(invoice_item)
+
+            # Add tax details
+            for tax in details.get('tax_details', []):
+                tax_detail = TaxDetails(
+                    document_id=document_id,
+                    tax_type=tax.get('tax_type', 'N/A'),
+                    tax_rate=float(tax.get('tax_rate', 0)),
+                    tax_amount=float(tax.get('tax_amount', 0)),
+                    description=tax.get('description', 'N/A')
+                )
+                invoice_details.tax_details.append(tax_detail)
+
+            db.add(invoice_details)
+            db.commit()
+            return invoice_details
             
-            # Create relationships based on schema
-            for entity_schema in document_schema.get('entities', []):
-                for relationship in entity_schema.get('relationships', []):
-                    source_entity = entity_schema['name']
-                    target_entity = relationship['related_to']
-                    relationship_type = relationship['relationship_type'].upper().replace(' ', '_')
-                    
-                    # Create relationship if both entities exist
-                    if source_entity in extracted_data and target_entity in extracted_data:
-                        source_data = extracted_data[source_entity]
-                        target_data = extracted_data[target_entity]
-                        
-                        # Handle different combinations of single/list entities
-                        if isinstance(source_data, list) and isinstance(target_data, list):
-                            # Many-to-many relationship (simplistic approach - link all to all)
-                            for i in range(len(source_data)):
-                                for j in range(len(target_data)):
-                                    self._create_relationship(
-                                        session, document_id, f"{source_entity}_{i}", 
-                                        f"{target_entity}_{j}", relationship_type
-                                    )
-                        elif isinstance(source_data, list):
-                            # Many-to-one relationship
-                            for i in range(len(source_data)):
-                                self._create_relationship(
-                                    session, document_id, f"{source_entity}_{i}", 
-                                    target_entity, relationship_type
-                                )
-                        elif isinstance(target_data, list):
-                            # One-to-many relationship
-                            for j in range(len(target_data)):
-                                self._create_relationship(
-                                    session, document_id, source_entity, 
-                                    f"{target_entity}_{j}", relationship_type
-                                )
-                        else:
-                            # One-to-one relationship
-                            self._create_relationship(
-                                session, document_id, source_entity, 
-                                target_entity, relationship_type
-                            )
-
-    def _create_entity_node(self, session, document_id: str, entity_type: str, entity_data: Dict, node_id: str) -> None:
-        """Create a node for an entity with dynamic properties"""
-        # Normalize entity data
-        normalized_data = {k: self.normalize_value(v) for k, v in entity_data.items() if v is not None}
-        normalized_data['node_id'] = node_id
-        
-        # Sanitize entity type for Neo4j label (remove special characters and spaces)
-        sanitized_type = re.sub(r'[^a-zA-Z0-9_]', '_', entity_type)
-        
-        # Create node with sanitized label
-        cypher = f"""
-        MATCH (d:Document {{id: $document_id}})
-        CREATE (e:{sanitized_type} $properties)
-        CREATE (d)-[:CONTAINS]->(e)
-        """
-        session.run(cypher, document_id=document_id, properties=normalized_data)
-
-    def _create_relationship(self, session, document_id: str, source_id: str, target_id: str, relationship_type: str) -> None:
-        """Create relationship between entities"""
-        cypher = f"""
-        MATCH (d:Document {{id: $document_id}})
-        MATCH (source {{node_id: $source_id}})<-[:CONTAINS]-(d)
-        MATCH (target {{node_id: $target_id}})<-[:CONTAINS]-(d)
-        CREATE (source)-[:{relationship_type}]->(target)
-        """
-        session.run(cypher, document_id=document_id, source_id=source_id, target_id=target_id)
-
-    def semantic_search_graph(self, query: str, document_type: Optional[str] = None) -> List[Dict]:
-        """Perform semantic search on the knowledge graph"""
-        # First, ask Gemini to interpret what entities and relationships to search for
-        search_prompt = f"""
-        Given this search query: "{query}"
-        
-        Identify:
-        1. The main entity types being searched for
-        2. Any specific attributes or conditions mentioned
-        3. Any relationships that should be traversed
-        
-        Provide a response in JSON format:
-        {{
-            "entity_types": ["type1", "type2"],
-            "attributes": [{{"entity": "entity_name", "attribute": "attribute_name", "condition": "condition", "value": "value"}}],
-            "relationships": [{{"from": "entity_type1", "to": "entity_type2", "type": "relationship_type"}}]
-        }}
-        """
-        
-        try:
-            response = self.gemini_model.generate_content(search_prompt)
-            # Extract JSON from the response
-            json_text = response.text
-            if '```json' in json_text:
-                json_text = json_text.split('```json')[1].split('```')[0].strip()
-            elif '```' in json_text:
-                json_text = json_text.split('```')[1].split('```')[0].strip()
-                
-            search_params = json.loads(json_text)
         except Exception as e:
-            search_params = {"entity_types": [], "attributes": [], "relationships": []}
-        
-        # Build Cypher query based on search parameters
-        cypher_parts = ["MATCH (d:Document)"]
-        
-        if document_type:
-            cypher_parts.append(f"WHERE d.type = '{document_type}'")
-        
-        # Add entity type matches
-        for i, entity_type in enumerate(search_params.get('entity_types', [])):
-            var_name = f"e{i}"
-            cypher_parts.append(f"MATCH (d)-[:CONTAINS]->({var_name}:{entity_type})")
-        
-        # Add attribute conditions
-        where_conditions = []
-        for attr in search_params.get('attributes', []):
-            entity_var = attr['entity']
-            attribute_name = attr['attribute']
-            condition = attr['condition']
-            value = attr['value']
-            
-            if condition == "equals":
-                where_conditions.append(f"{entity_var}.{attribute_name} = '{value}'")
-            elif condition == "contains":
-                where_conditions.append(f"{entity_var}.{attribute_name} CONTAINS '{value}'")
-            elif condition == "greater_than":
-                where_conditions.append(f"{entity_var}.{attribute_name} > {value}")
-            elif condition == "less_than":
-                where_conditions.append(f"{entity_var}.{attribute_name} < {value}")
-        
-        if where_conditions:
-            cypher_parts.append("WHERE " + " AND ".join(where_conditions))
-        
-        # Add relationship traversals
-        for rel in search_params.get('relationships', []):
-            from_type = rel['from']
-            to_type = rel['to']
-            rel_type = rel['type'].upper().replace(' ', '_')
-            
-            cypher_parts.append(f"MATCH ({from_type})-[:{rel_type}]->({to_type})")
-        
-        # Return results
-        return_vars = ["d.id as document_id", "d.type as document_type"]
-        for i, entity_type in enumerate(search_params.get('entity_types', [])):
-            var_name = f"e{i}"
-            return_vars.append(f"{var_name} as {entity_type}")
-        
-        cypher_parts.append("RETURN " + ", ".join(return_vars))
-        
-        # Execute query
-        cypher_query = " ".join(cypher_parts)
-        
-        with neo4j_driver.session() as session:
-            result = session.run(cypher_query)
-            search_results = [dict(record) for record in result]
-            
-        return search_results
+            db.rollback()
+            print(f"Error saving invoice details: {str(e)}")
+            raise
 
-    def process_document(self, input_data: Union[str, bytes], input_type: str) -> Dict:
+    def generate_document_name(self, image_or_text, is_image=False):
+        """Generate a descriptive name for the document using Gemini"""
+        prompt = """
+        Generate a concise but descriptive filename for this invoice document.
+        The filename should follow this format: "<BillerCompany>_Invoice_<InvoiceNumber>_<Date>".
+        If any part is not found, use a reasonable alternative.
+        Keep it under 50 characters and use only alphanumeric characters, underscores, and hyphens.
+        Do not include file extension.
         """
-        Main function to process a document dynamically
-        """
+        
         try:
-            # Step 1: Upload PDF to S3 and get the content
-            if input_type == 'pdf':
-                file_name = f"documents/{str(uuid.uuid4())}.pdf"
-                with open(input_data, 'rb') as pdf_file:
-                    s3_client.upload_fileobj(pdf_file, S3_BUCKET_NAME, file_name)
+            if is_image:
+                response = self.gemini_model.generate_content([prompt, image_or_text])
+            else:
+                response = self.gemini_model.generate_content(f"{prompt}\n\nInvoice text:\n{image_or_text}")
+
+            name = response.text.strip()
+            # Clean the filename
+            name = re.sub(r'[^\w\-_]', '_', name)  # Replace invalid chars with underscore
+            name = re.sub(r'_+', '_', name)  # Replace multiple underscores with single
+            name = name[:50]  # Limit length
+            return name
+        except Exception as e:
+            print(f"Error generating document name: {str(e)}")
+            return f"Invoice_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    def _extract_text_from_file(self, file_path: str) -> str:
+        """Extract text from PDF or image file using Gemini vision"""
+        file_ext = os.path.splitext(file_path.lower())[1]
+        
+        try:
+            if file_ext == '.pdf':
+                # Convert PDF to images
+                pages = pdf2image.convert_from_path(file_path)
+                if not pages:
+                    raise ValueError("No pages found in PDF")
                 
-                # Get the content from S3
-                response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=file_name)
-                pdf_content = response['Body'].read()
+                full_text = ""
                 
-                # Extract text from PDF content
-                with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
-                    temp_file.write(pdf_content)
-                    temp_file_path = temp_file.name
-                
-                text = ""
-                with fitz.open(temp_file_path) as doc:
-                    for page in doc:
-                        text += page.get_text()
-                
-                os.unlink(temp_file_path)
-                
-                if not text:
-                    return {"error": "Failed to extract text from PDF"}
-                
-                # Step 2: Ask Gemini to analyze document
-                analysis_prompt = f"""
-                Analyze this document and create a knowledge graph structure.
-                
-                Document Text: {text[:4000]}
-                Document S3 Key: {file_name}
-                
-                Create a knowledge graph structure that captures all important entities and their relationships.
-                Focus on extracting invoice-specific information like invoice number, date, items, amounts, etc.
-                
-                Return ONLY the JSON response in this exact format:
-                {{
-                    "document_node": {{
-                        "type": "Invoice",
-                        "properties": {{
-                            "invoice_number": "extracted invoice number",
-                            "date": "extracted date",
-                            "total_amount": "extracted total",
-                            "s3_key": "{file_name}"
-                        }}
-                    }},
-                    "entities": [
-                        {{
-                            "label": "LineItem",
-                            "properties": {{
-                                "description": "item description",
-                                "quantity": "item quantity",
-                                "unit_price": "price per unit",
-                                "total": "line total"
-                            }}
-                        }}
-                    ],
-                    "relationships": [
-                        {{
-                            "from_node": 0,
-                            "to_node": 1,
-                            "type": "CONTAINS",
-                            "properties": {{}}
-                        }}
-                    ]
-                }}
-                """
-                
-                response = self.gemini_model.generate_content(analysis_prompt)
-                response_text = response.text.strip()
-                
-                # Clean up the response text to ensure valid JSON
-                if '```json' in response_text:
-                    response_text = response_text.split('```json')[1].split('```')[0].strip()
-                elif '```' in response_text:
-                    response_text = response_text.split('```')[1].split('```')[0].strip()
-                
-                try:
-                    graph_structure = json.loads(response_text)
-                except json.JSONDecodeError as e:
-                    print(f"Failed to parse JSON: {response_text}")
-                    return {"error": f"Failed to parse Gemini response: {str(e)}"}
-                
-                # Step 3: Create knowledge graph
-                with neo4j_driver.session() as session:
-                    # Create document node
-                    doc_props = graph_structure["document_node"]["properties"]
-                    doc_type = graph_structure["document_node"]["type"]
-                    document_id = str(uuid.uuid4())
+                # Process each page with Gemini
+                for page in pages:
+                    # Use Gemini to extract text
+                    prompt = """
+                    Extract all text from this image, preserving the exact formatting and numbers.
+                    Include ALL text visible in the image, even if it seems unimportant.
+                    Do not summarize or skip any text.
+                    """
+                    response = self.gemini_model.generate_content([prompt, page])
                     
-                    session.run(
-                        """
-                        CREATE (d:Invoice $properties)
-                        SET d.id = $document_id
-                        """,
-                        properties=doc_props,
-                        document_id=document_id
+                    if not response.text:
+                        raise ValueError(f"Gemini returned empty text for page")
+                    
+                    full_text += response.text + "\n\n"
+                
+                if not full_text.strip():
+                    raise ValueError("No text extracted from PDF")
+                
+                return full_text
+            else:
+                # Process single image
+                image = Image.open(file_path)
+                # Ensure the image is valid
+                image.verify()
+                # Reopen after verify
+                image = Image.open(file_path)
+                
+                # Use Gemini to extract text
+                prompt = """
+                Extract all text from this image, preserving the exact formatting and numbers.
+                Include ALL text visible in the image, even if it seems unimportant.
+                Do not summarize or skip any text.
+                """
+                response = self.gemini_model.generate_content([prompt, image])
+                
+                if not response.text:
+                    raise ValueError("Gemini returned empty text for image")
+                
+                return response.text
+                
+        except Exception as e:
+            print(f"Error extracting text from file: {str(e)}")
+            raise ValueError(f"Failed to extract text: {str(e)}")
+
+    def process_document(self, file_path: str, file_name: str, db: Session) -> Dict:
+        """Process a document and store its chunks in Chroma"""
+        try:
+            # Load the image/PDF for Gemini vision processing
+            file_ext = os.path.splitext(file_path.lower())[1]
+            is_image = file_ext != '.pdf'
+            
+            if is_image:
+                image = Image.open(file_path)
+                # Verify image is valid
+                image.verify()
+                # Reopen after verify
+                image = Image.open(file_path)
+            
+            # Generate document ID
+            document_id = str(uuid.uuid4())
+            
+            # Extract text using Gemini vision
+            text = self._extract_text_from_file(file_path)
+            
+            if not text.strip():
+                raise ValueError("No text could be extracted from the document")
+            
+            # Generate document name using Gemini vision
+            if is_image:
+                generated_name = self.generate_document_name(image, is_image=True)
+            else:
+                generated_name = self.generate_document_name(text)
+            
+            # Extract invoice details using Gemini vision
+            if is_image:
+                invoice_details = self.extract_invoice_details(image, is_image=True)
+            else:
+                invoice_details = self.extract_invoice_details(text)
+            
+            if invoice_details:
+                invoice_details['generated_name'] = generated_name
+                self.save_invoice_details(document_id, invoice_details, db)
+            
+            # Split text into chunks
+            texts = self.text_splitter.split_text(text)
+            
+            if not texts:
+                raise ValueError("Text splitting resulted in no chunks")
+            
+            # Create documents with metadata
+            documents = [
+                Document(
+                    page_content=chunk,
+                    metadata={
+                        "document_id": document_id,
+                        "source": file_name,
+                        "chunk_id": f"chunk_{i}",
+                        "page_number": i // 2 + 1
+                    }
+                ) for i, chunk in enumerate(texts)
+            ]
+            
+            # Create Chroma collection for this document
+            vectorstore = Chroma(
+                collection_name=document_id,
+                embedding_function=self.embeddings,
+                persist_directory=self.persist_directory,
+                client_settings=self.chroma_settings
+            )
+            
+            # Add documents to the collection
+            vectorstore.add_documents(documents)
+            vectorstore.persist()
+            
+            # Upload to S3
+            s3_key = f"documents/{document_id}/{file_name}"
+            with open(file_path, 'rb') as file:
+                s3_client.upload_fileobj(file, S3_BUCKET_NAME, s3_key)
+            
+            return {
+                "document_id": document_id,
+                "s3_key": s3_key,
+                "name": file_name,
+                "num_chunks": len(texts)
+            }
+            
+        except ValueError as e:
+            print(f"Validation error in process_document: {str(e)}")
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            print(f"Error in process_document: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
+
+    def search_document(self, document_id: str, query: str) -> Dict:
+        """Search within a specific document"""
+        try:
+            # Load the document's vector store
+            vectorstore = Chroma(
+                collection_name=document_id,
+                embedding_function=self.embeddings,
+                persist_directory=self.persist_directory,
+                client_settings=self.chroma_settings
+            )
+            
+            # Search for relevant chunks
+            results = vectorstore.similarity_search_with_relevance_scores(
+                query,
+                k=5  # Number of results to return
+            )
+            
+            # Format results
+            formatted_results = []
+            for doc, score in results:
+                formatted_results.append({
+                    "content": doc.page_content,
+                    "relevance": float(score),
+                    "metadata": doc.metadata,
+                    "page": doc.metadata.get("page_number", 1)
+                })
+            
+            # Sort results by relevance score
+            formatted_results.sort(key=lambda x: x["relevance"], reverse=True)
+            
+            # Generate AI explanation using Gemini
+            context = "\n".join([
+                f"[Page {r['page']}]: {r['content']}" 
+                for r in formatted_results[:3]
+            ])
+            explanation = self._generate_explanation(query, context)
+            
+            return {
+                "query": query,
+                "results": formatted_results,
+                "explanation": explanation,
+                "total_results": len(formatted_results)
+            }
+            
+        except Exception as e:
+            raise Exception(f"Error searching document: {str(e)}")
+
+    def _generate_explanation(self, query: str, context: str) -> str:
+        """Generate an AI explanation for the search results"""
+        prompt = f"""
+        Based on the following document excerpts, provide a clear and concise answer to the query.
+        If the context doesn't contain relevant information, say so.
+        
+        Query: {query}
+        
+        Document Excerpts:
+        {context}
+        
+        Please provide a detailed answer, citing specific information from the document where possible.
+        If you're not certain about something, say so.
+        
+        Answer:
+        """
+        
+        try:
+            response = self.gemini_model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            return f"Error generating explanation: {str(e)}"
+
+    def delete_document(self, document_id: str) -> None:
+        """Delete a document's vectors and S3 file"""
+        try:
+            # Delete from Chroma
+            vectorstore = Chroma(
+                collection_name=document_id,
+                embedding_function=self.embeddings,
+                persist_directory=self.persist_directory,
+                client_settings=self.chroma_settings
+            )
+            vectorstore.delete_collection()
+            vectorstore.persist()
+            
+            # Delete from S3
+            response = s3_client.list_objects_v2(
+                Bucket=S3_BUCKET_NAME,
+                Prefix=f"documents/{document_id}/"
+            )
+            
+            if 'Contents' in response:
+                for obj in response['Contents']:
+                    s3_client.delete_object(
+                        Bucket=S3_BUCKET_NAME,
+                        Key=obj['Key']
                     )
                     
-                    # Create entity nodes
-                    for idx, entity in enumerate(graph_structure["entities"]):
-                        sanitized_label = re.sub(r'[^a-zA-Z0-9_]', '_', entity["label"])
-                        session.run(
-                            f"""
-                            MATCH (d:Invoice {{id: $document_id}})
-                            CREATE (e:{sanitized_label} $properties)
-                            CREATE (d)-[:CONTAINS]->(e)
-                            SET e.node_id = $node_id
-                            """,
-                            document_id=document_id,
-                            properties=entity["properties"],
-                            node_id=f"node_{idx}"
-                        )
-                    
-                    # Create relationships
-                    for rel in graph_structure.get("relationships", []):
-                        from_id = f"node_{rel['from_node']}"
-                        to_id = f"node_{rel['to_node']}"
-                        rel_type = re.sub(r'[^a-zA-Z0-9_]', '_', rel["type"].upper())
-                        
-                        session.run(
-                            f"""
-                            MATCH (d:Invoice {{id: $document_id}})
-                            MATCH (source {{node_id: $from_id}})<-[:CONTAINS]-(d)
-                            MATCH (target {{node_id: $to_id}})<-[:CONTAINS]-(d)
-                            CREATE (source)-[r:{rel_type}]->(target)
-                            SET r = $properties
-                            """,
-                            document_id=document_id,
-                            from_id=from_id,
-                            to_id=to_id,
-                            properties=rel.get("properties", {})
-                        )
-                
-                return {
-                    "document_id": document_id,
-                    "s3_key": file_name,
-                    "graph_structure": graph_structure
-                }
-            
-            else:
-                return {"error": "Only PDF processing is supported"}
-            
         except Exception as e:
-            return {"error": str(e)}
-
-    def get_document(self, document_id: str) -> Dict:
-        """Retrieve a specific document with all its entities and relationships"""
-        with neo4j_driver.session() as session:
-            # Get document with all its properties and related items
-            result = session.run(
-                """
-                MATCH (d:Invoice {id: $document_id})
-                OPTIONAL MATCH (d)-[:CONTAINS]->(item)
-                RETURN d.id as document_id,
-                       d.invoice_number as invoice_number,
-                       d.date as date,
-                       d.total_amount as total_amount,
-                       d.s3_key as s3_key,
-                       collect(properties(item)) as line_items
-                """,
-                document_id=document_id
-            )
-            
-            record = result.single()
-            if not record:
-                return {"error": f"Document {document_id} not found"}
-            
-            return dict(record)
+            raise Exception(f"Error deleting document: {str(e)}")
 
 class DocumentExtractorAPI:
     def __init__(self):
-        self.extractor = DynamicDocumentExtractor()
+        self.processor = DocumentProcessor()
         
-    def process_input(self, input_data: Union[str, bytes], input_type: str) -> Dict:
-        """API endpoint to process document input"""
-        return self.extractor.process_document(input_data, input_type)
+    def process_document(self, file_path: str, db: Session) -> Dict:
+        """Process a new document"""
+        file_name = os.path.basename(file_path)
+        return self.processor.process_document(file_path, file_name, db)
         
-    def search(self, query: str, document_type: Optional[str] = None) -> List[Dict]:
-        """API endpoint to search for information"""
-        cypher_query = """
-        MATCH (i:Invoice)-[:CONTAINS]->(item)
-        WHERE i.invoice_number IS NOT NULL
-        RETURN i.id as document_id, 
-               i.invoice_number as invoice_number,
-               i.date as date,
-               i.total_amount as total_amount,
-               collect(properties(item)) as line_items
-        """
+    def search_document(self, document_id: str, query: str) -> Dict:
+        """Search within a specific document"""
+        return self.processor.search_document(document_id, query)
         
-        with neo4j_driver.session() as session:
-            result = session.run(cypher_query)
-            return [dict(record) for record in result]
-        
-    def get_document(self, document_id: str) -> Dict:
-        """API endpoint to retrieve a specific document"""
-        return self.extractor.get_document(document_id)
+    def delete_document(self, document_id: str) -> None:
+        """Delete a document"""
+        return self.processor.delete_document(document_id)
 
 # Example usage
 if __name__ == "__main__":
@@ -577,14 +537,12 @@ if __name__ == "__main__":
     
     # Example: Process a local PDF file
     pdf_path = "/Users/pi-in-140/Downloads/Invoice-989B3CF6-0013.pdf"
-    result = api.process_input(pdf_path, "pdf")
+    result = api.process_document(pdf_path)
     print(json.dumps(result, indent=2))
     
     # Example: Perform a search
-    search_results = api.search("Find all items with quantity greater than 10")
+    search_results = api.search_document(result["document_id"], "Find all items with quantity greater than 10")
     print(json.dumps(search_results, indent=2))
     
-    # Example: Get document details
-    if result.get("document_id"):
-        document = api.get_document(result["document_id"])
-        print(json.dumps(document, indent=2))
+    # Example: Delete document
+    api.delete_document(result["document_id"])

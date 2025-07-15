@@ -1,0 +1,120 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+ENV/
+.venv/
+venv
+
+# VS Code settings
+.vscode/
+
+# MacOS system files
+.DS_Store
+
+# Python virtualenv and pipenv
+pip-log.txt
+pip-delete-this-directory.txt
+Pipfile.lock
+poetry.lock
+
+# Environment variables
+.env
+.env.*
+
+# Database
+*.sqlite3
+*.db
+
+# Pytest
+.cache/
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+
+# coverage reports
+htmlcov/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+
+# Test results
+junit-*.xml
+
+# Logs
+*.log
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# System files
+Thumbs.db
+desktop.ini
+
+
+# === Local ChromaDB Folder ===
+chroma/
+
+# === Python Bytecode ===
+__pycache__/
+*.py[cod]
+*$py.class
+
+# === Virtual Environment ===
+venv/
+
+# === Environment Variables ===
+.env
+
+# === Local ChromaDB ===
+chroma_db/
+chroma_db/chroma.sqlite3
+chroma_db
+
+# === Logs ===
+*.log
+
+# === IDE / Editor ===
+.vscode/
+.idea/
+
+# === macOS Files ===
+.DS_Store
+
+# === Test / Coverage ===
+.pytest_cache/
+.coverage
+.cache/
+htmlcov/
+
+# === Build Artifacts ===
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# === Mypy / Lint ===
+.mypy_cache/
+
+# === Jupyter ===
+.ipynb_checkpoints/
+.env
+.env
+.env
