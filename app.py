@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from typing import Optional, Dict, List
-import google.generativeai as genai
+import openai
 import os
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -11,7 +11,7 @@ import json
 import logging
 from langchain_community.callbacks.manager import get_openai_callback
 from langchain_core.messages import HumanMessage, AIMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 import io
 from urllib.parse import unquote
 import boto3
@@ -45,10 +45,10 @@ app.add_middleware(
 # Initialize DocumentExtractorAPI
 doc_api = DocumentExtractorAPI()
 
-# Initialize Gemini
-GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
-genai.configure(api_key=GOOGLE_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+# Initialize OpenAI
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+openai.api_key = OPENAI_API_KEY
+openai_model = ChatOpenAI(model="gpt-3.5-turbo", api_key=OPENAI_API_KEY)
 
 # S3 Configuration
 S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME')

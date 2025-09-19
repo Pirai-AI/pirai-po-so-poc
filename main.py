@@ -3,9 +3,9 @@ import json
 import boto3
 from dotenv import load_dotenv
 from langchain_community.vectorstores import Chroma
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-import google.generativeai as genai
+import openai
 from typing import Dict, List, Union, Optional
 import fitz  # PyMuPDF
 import uuid
@@ -35,10 +35,10 @@ S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME')
 AWS_REGION = os.getenv('AWS_REGION')
 AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
-GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
-# Initialize Gemini
-genai.configure(api_key=GOOGLE_API_KEY)
+# Initialize OpenAI
+openai.api_key = OPENAI_API_KEY
 
 # Initialize S3 client
 s3_client = boto3.client(
@@ -50,10 +50,11 @@ s3_client = boto3.client(
 
 class DocumentProcessor:
     def __init__(self):
-        self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
-        self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
-            google_api_key=GOOGLE_API_KEY
+        from langchain_openai import ChatOpenAI
+        self.openai_model = ChatOpenAI(model="gpt-3.5-turbo", api_key=OPENAI_API_KEY)
+        self.embeddings = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            openai_api_key=OPENAI_API_KEY
         )
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
@@ -117,12 +118,15 @@ class DocumentProcessor:
         
         try:
             if is_image:
-                response = self.gemini_model.generate_content([prompt, image_or_text])
+                # For images, we need to use OpenAI's vision model
+                from langchain_openai import ChatOpenAI
+                vision_model = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
+                response = vision_model.invoke([{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_or_text}"}}])
             else:
-                response = self.gemini_model.generate_content(f"{prompt}\n\nInvoice text:\n{image_or_text}")
+                response = self.openai_model.invoke(f"{prompt}\n\nInvoice text:\n{image_or_text}")
 
             # Clean the response text to ensure valid JSON
-            cleaned_text = response.text.strip()
+            cleaned_text = response.content.strip()
             if cleaned_text.startswith("```json"):
                 cleaned_text = cleaned_text[7:-3]  # Remove ```json and ``` markers
             details = json.loads(cleaned_text)
@@ -255,11 +259,14 @@ class DocumentProcessor:
         
         try:
             if is_image:
-                response = self.gemini_model.generate_content([prompt, image_or_text])
+                # For images, we need to use OpenAI's vision model
+                from langchain_openai import ChatOpenAI
+                vision_model = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
+                response = vision_model.invoke([{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_or_text}"}}])
             else:
-                response = self.gemini_model.generate_content(f"{prompt}\n\nInvoice text:\n{image_or_text}")
+                response = self.openai_model.invoke(f"{prompt}\n\nInvoice text:\n{image_or_text}")
 
-            name = response.text.strip()
+            name = response.content.strip()
             # Clean the filename
             name = re.sub(r'[^\w\-_]', '_', name)  # Replace invalid chars with underscore
             name = re.sub(r'_+', '_', name)  # Replace multiple underscores with single
@@ -282,20 +289,22 @@ class DocumentProcessor:
                 
                 full_text = ""
                 
-                # Process each page with Gemini
+                # Process each page with OpenAI
                 for page in pages:
-                    # Use Gemini to extract text
+                    # Use OpenAI to extract text
                     prompt = """
                     Extract all text from this image, preserving the exact formatting and numbers.
                     Include ALL text visible in the image, even if it seems unimportant.
                     Do not summarize or skip any text.
                     """
-                    response = self.gemini_model.generate_content([prompt, page])
+                    from langchain_openai import ChatOpenAI
+                    vision_model = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
+                    response = vision_model.invoke([{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{self._encode_image_to_base64(page)}"}}])
                     
-                    if not response.text:
-                        raise ValueError(f"Gemini returned empty text for page")
+                    if not response.content:
+                        raise ValueError(f"OpenAI returned empty text for page")
                     
-                    full_text += response.text + "\n\n"
+                    full_text += response.content + "\n\n"
                 
                 if not full_text.strip():
                     raise ValueError("No text extracted from PDF")
@@ -309,18 +318,20 @@ class DocumentProcessor:
                 # Reopen after verify
                 image = Image.open(file_path)
                 
-                # Use Gemini to extract text
+                # Use OpenAI to extract text
                 prompt = """
                 Extract all text from this image, preserving the exact formatting and numbers.
                 Include ALL text visible in the image, even if it seems unimportant.
                 Do not summarize or skip any text.
                 """
-                response = self.gemini_model.generate_content([prompt, image])
+                from langchain_openai import ChatOpenAI
+                vision_model = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
+                response = vision_model.invoke([{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{self._encode_image_to_base64(image)}"}}])
                 
-                if not response.text:
-                    raise ValueError("Gemini returned empty text for image")
+                if not response.content:
+                    raise ValueError("OpenAI returned empty text for image")
                 
-                return response.text
+                return response.content
                 
         except Exception as e:
             print(f"Error extracting text from file: {str(e)}")
@@ -480,8 +491,8 @@ class DocumentProcessor:
         """
         
         try:
-            response = self.gemini_model.generate_content(prompt)
-            return response.text
+            response = self.openai_model.invoke(prompt)
+            return response.content
         except Exception as e:
             return f"Error generating explanation: {str(e)}"
 

@@ -3,7 +3,8 @@ requests
 python-dotenv
 neo4j
 sentence-transformers
-google-generativeai
+openai
+langchain-openai
 PyMuPDF
 python-docx
 beautifulsoup4
@@ -12,7 +13,6 @@ python-multipart
 uvicorn
 langchain
 langchain-community
-langchain_google_genai
 sqlalchemy
 psycopg2-binary
 pytesseract
