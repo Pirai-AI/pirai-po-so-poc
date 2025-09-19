@@ -120,8 +120,13 @@ class DocumentProcessor:
             if is_image:
                 # For images, we need to use OpenAI's vision model
                 from langchain_openai import ChatOpenAI
+                from langchain_core.messages import HumanMessage
                 vision_model = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
-                response = vision_model.invoke([{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_or_text}"}}])
+                message = HumanMessage(content=[
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_or_text}"}}
+                ])
+                response = vision_model.invoke([message])
             else:
                 response = self.openai_model.invoke(f"{prompt}\n\nInvoice text:\n{image_or_text}")
 
@@ -261,8 +266,13 @@ class DocumentProcessor:
             if is_image:
                 # For images, we need to use OpenAI's vision model
                 from langchain_openai import ChatOpenAI
+                from langchain_core.messages import HumanMessage
                 vision_model = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
-                response = vision_model.invoke([{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_or_text}"}}])
+                message = HumanMessage(content=[
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_or_text}"}}
+                ])
+                response = vision_model.invoke([message])
             else:
                 response = self.openai_model.invoke(f"{prompt}\n\nInvoice text:\n{image_or_text}")
 
@@ -298,8 +308,13 @@ class DocumentProcessor:
                     Do not summarize or skip any text.
                     """
                     from langchain_openai import ChatOpenAI
+                    from langchain_core.messages import HumanMessage
                     vision_model = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
-                    response = vision_model.invoke([{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{self._encode_image_to_base64(page)}"}}])
+                    message = HumanMessage(content=[
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{self._encode_image_to_base64(page)}"}}
+                    ])
+                    response = vision_model.invoke([message])
                     
                     if not response.content:
                         raise ValueError(f"OpenAI returned empty text for page")
@@ -325,8 +340,13 @@ class DocumentProcessor:
                 Do not summarize or skip any text.
                 """
                 from langchain_openai import ChatOpenAI
+                from langchain_core.messages import HumanMessage
                 vision_model = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
-                response = vision_model.invoke([{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{self._encode_image_to_base64(image)}"}}])
+                message = HumanMessage(content=[
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{self._encode_image_to_base64(image)}"}}
+                ])
+                response = vision_model.invoke([message])
                 
                 if not response.content:
                     raise ValueError("OpenAI returned empty text for image")
