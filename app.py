@@ -439,10 +439,18 @@ async def get_document_info(id: str):
         document = doc_api.get_document(id)
         if "error" in document:
             return JSONResponse(status_code=404, content=document)
-        # Ensure 'id' key exists for frontend
-        if "document_id" in document:
-            document["id"] = document["document_id"]
-        return JSONResponse(content=document)
+        
+        # Map fields to match frontend expectations (camelCase, stripping '$' for numbers if needed)
+        formatted_info = {
+            "id": document.get("document_id"),
+            "invoiceNumber": document.get("invoice_number", ""),
+            "invoiceDate": document.get("date", ""),
+            "terms": document.get("terms", ""),
+            "totalAmount": str(document.get("total_amount", "")).replace('$', '').replace(',', ''),
+            "billerInformation": document.get("biller_information", document.get("biller", "")),
+            "recipientInformation": document.get("recipient_information", document.get("recipient", ""))
+        }
+        return JSONResponse(content=formatted_info)
     except Exception as e:
         logger.error(f"Error retrieving document info: {str(e)}")
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -454,10 +462,40 @@ async def get_invoice_details(id: str):
         if "error" in document:
             return JSONResponse(status_code=404, content=document)
         
-        # Return the line items and maybe total amounts for the invoice details
+        # Clean up line items and parse floats for frontend table
+        items = []
+        for item in document.get("line_items", []):
+            try:
+                qty = float(item.get("quantity", 0))
+            except:
+                qty = 0
+            
+            try:
+                up = float(str(item.get("unit_price", "0")).replace('$', '').replace(',', ''))
+            except:
+                up = 0
+                
+            try:
+                tot = float(str(item.get("total", "0")).replace('$', '').replace(',', ''))
+            except:
+                tot = 0
+
+            items.append({
+                "item": item.get("description", item.get("item", "")),
+                "quantity": qty,
+                "unitPrice": up,
+                "total": tot
+            })
+            
+        try:
+            total_amount = float(str(document.get("total_amount", "0")).replace('$', '').replace(',', ''))
+        except:
+            total_amount = 0
+
         return JSONResponse(content={
-            "items": document.get("line_items", []),
-            "total_amount": document.get("total_amount")
+            "items": items,
+            "totalAmount": total_amount,
+            "taxDetails": document.get("tax_details", "No tax details available.")
         })
     except Exception as e:
         logger.error(f"Error retrieving invoice details: {str(e)}")
