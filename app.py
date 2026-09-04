@@ -143,7 +143,7 @@ def get_schema(driver):
         return {"nodes": node_schema, "relationships": rel_schema}
 
 
-@app.post("/process-document")
+@app.post("/posoapi/process-document")
 async def process_document(file: UploadFile):
     """
     Endpoint to process a document and create knowledge graph
@@ -171,7 +171,7 @@ async def process_document(file: UploadFile):
         )
 
 
-@app.post("/search-graph", response_model=AgentResponse)
+@app.post("/posoapi/search-graph", response_model=AgentResponse)
 async def search_graph(
         request: SearchRequest,
         driver: GraphDatabase.driver = Depends(get_neo4j_driver)
@@ -414,7 +414,7 @@ def generate_fallback_query(query, schema):
     """
 
 
-@app.get("/schema")
+@app.get("/posoapi/schema")
 async def get_database_schema(driver: GraphDatabase.driver = Depends(get_neo4j_driver)):
     """
     Get the database schema information
