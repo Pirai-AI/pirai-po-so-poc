@@ -440,15 +440,15 @@ async def get_document_info(id: str):
         if "error" in document:
             return JSONResponse(status_code=404, content=document)
         
-        # Map fields to match frontend expectations (camelCase, stripping '$' for numbers if needed)
+        # Map fields exactly to what the frontend JS expects
         formatted_info = {
             "id": document.get("document_id"),
-            "invoiceNumber": document.get("invoice_number", ""),
-            "invoiceDate": document.get("date", ""),
+            "invoice_number": document.get("invoice_number", ""),
+            "invoice_date": document.get("date", ""),
             "terms": document.get("terms", ""),
-            "totalAmount": str(document.get("total_amount", "")).replace('$', '').replace(',', ''),
-            "billerInformation": document.get("biller_information", document.get("biller", "")),
-            "recipientInformation": document.get("recipient_information", document.get("recipient", ""))
+            "total_amount": str(document.get("total_amount", "")).replace('$', '').replace(',', ''),
+            "biller_company": document.get("biller_information", document.get("biller", "")),
+            "recipient_name": document.get("recipient_information", document.get("recipient", ""))
         }
         return JSONResponse(content=formatted_info)
     except Exception as e:
@@ -481,10 +481,10 @@ async def get_invoice_details(id: str):
                 tot = 0
 
             items.append({
-                "item": item.get("description", item.get("item", "")),
+                "item_name": item.get("description", item.get("item", "")),
                 "quantity": qty,
-                "unitPrice": up,
-                "total": tot
+                "unit_price": up,
+                "total_price": tot
             })
             
         try:
@@ -494,8 +494,8 @@ async def get_invoice_details(id: str):
 
         return JSONResponse(content={
             "items": items,
-            "totalAmount": total_amount,
-            "taxDetails": document.get("tax_details", "No tax details available.")
+            "total_amount": total_amount,
+            "taxes": []
         })
     except Exception as e:
         logger.error(f"Error retrieving invoice details: {str(e)}")
