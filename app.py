@@ -3,7 +3,6 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from typing import Optional, Dict, List
-import google.generativeai as genai
 from neo4j import GraphDatabase
 import os
 from dotenv import load_dotenv
@@ -12,7 +11,7 @@ import json
 import logging
 from langchain_community.callbacks.manager import get_openai_callback
 from langchain_core.messages import HumanMessage, AIMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 
 # Import the DocumentExtractorAPI from main.py
 from main import DocumentExtractorAPI
@@ -39,10 +38,8 @@ app.add_middleware(
 # Initialize DocumentExtractorAPI
 doc_api = DocumentExtractorAPI()
 
-# Initialize Gemini
-GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
-genai.configure(api_key=GOOGLE_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+# Initialize OpenAI
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
 # Neo4j Configuration
 NEO4J_URI = os.getenv('NEO4J_URI', 'bolt://localhost:7687')
@@ -194,8 +191,8 @@ async def search_graph(
         # Log the retrieved schema information
         logger.info("Retrieved schema information")
 
-        # Initialize LangChain Gemini chat model
-        chat_model = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GOOGLE_API_KEY)
+        # Initialize LangChain OpenAI chat model
+        chat_model = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
 
         # Build prompt
         prompt = f"""
@@ -241,7 +238,7 @@ async def search_graph(
         response = chat_model.invoke(messages)
         response_text = response.content.strip()
 
-        # Update token counter (estimated for Gemini since exact counts aren't available)
+        # Update token counter (estimated since exact counts might not always be returned)
         # Using rough estimation: 1 token ≈ 4 characters
         prompt_tokens = len(prompt) // 4
         completion_tokens = len(response_text) // 4

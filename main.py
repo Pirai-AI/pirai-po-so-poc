@@ -4,7 +4,7 @@ import boto3
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
-import google.generativeai as genai
+from openai import OpenAI
 from typing import Dict, List, Union, Optional, Any
 import fitz  # PyMuPDF
 import re
@@ -25,9 +25,9 @@ AWS_REGION = os.getenv('AWS_REGION')
 AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 
-# Google Gemini API Key
-GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
-genai.configure(api_key=GOOGLE_API_KEY)
+# OpenAI API Key
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Neo4j Configuration
 NEO4J_URI = os.getenv('NEO4J_URI', 'bolt://localhost:7687')
@@ -51,7 +51,7 @@ neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD)
 
 class DynamicDocumentExtractor:
     def __init__(self):
-        self.gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+        pass
         
     def preprocess_document(self, input_data: Union[str, bytes], input_type: str) -> str:
         """
@@ -115,9 +115,12 @@ class DynamicDocumentExtractor:
         """
         
         try:
-            response = self.gemini_model.generate_content(prompt)
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}]
+            )
             # Extract JSON from the response
-            json_text = response.text
+            json_text = response.choices[0].message.content
             if '```json' in json_text:
                 json_text = json_text.split('```json')[1].split('```')[0].strip()
             elif '```' in json_text:
@@ -153,9 +156,12 @@ class DynamicDocumentExtractor:
         """
         
         try:
-            response = self.gemini_model.generate_content(prompt)
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}]
+            )
             # Extract JSON from the response
-            json_text = response.text
+            json_text = response.choices[0].message.content
             if '```json' in json_text:
                 json_text = json_text.split('```json')[1].split('```')[0].strip()
             elif '```' in json_text:
@@ -300,9 +306,12 @@ class DynamicDocumentExtractor:
         """
         
         try:
-            response = self.gemini_model.generate_content(search_prompt)
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": search_prompt}]
+            )
             # Extract JSON from the response
-            json_text = response.text
+            json_text = response.choices[0].message.content
             if '```json' in json_text:
                 json_text = json_text.split('```json')[1].split('```')[0].strip()
             elif '```' in json_text:
@@ -376,24 +385,31 @@ class DynamicDocumentExtractor:
             # Step 1: Upload PDF to S3 and get the content
             if input_type == 'pdf':
                 file_name = f"documents/{str(uuid.uuid4())}.pdf"
-                with open(input_data, 'rb') as pdf_file:
-                    s3_client.upload_fileobj(pdf_file, S3_BUCKET_NAME, file_name)
                 
-                # Get the content from S3
-                response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=file_name)
-                pdf_content = response['Body'].read()
-                
-                # Extract text from PDF content
-                with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
-                    temp_file.write(pdf_content)
-                    temp_file_path = temp_file.name
-                
+                if S3_BUCKET_NAME:
+                    with open(input_data, 'rb') as pdf_file:
+                        s3_client.upload_fileobj(pdf_file, S3_BUCKET_NAME, file_name)
+                    
+                    # Get the content from S3
+                    response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=file_name)
+                    pdf_content = response['Body'].read()
+                    
+                    # Extract text from PDF content
+                    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
+                        temp_file.write(pdf_content)
+                        temp_file_path = temp_file.name
+                else:
+                    # Skip S3 and use local file directly for local testing
+                    temp_file_path = input_data
+                    file_name = "local-file-bypass-s3"
+
                 text = ""
                 with fitz.open(temp_file_path) as doc:
                     for page in doc:
                         text += page.get_text()
                 
-                os.unlink(temp_file_path)
+                if S3_BUCKET_NAME:
+                    os.unlink(temp_file_path)
                 
                 if not text:
                     return {"error": "Failed to extract text from PDF"}
@@ -441,8 +457,11 @@ class DynamicDocumentExtractor:
                 }}
                 """
                 
-                response = self.gemini_model.generate_content(analysis_prompt)
-                response_text = response.text.strip()
+                response = openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": analysis_prompt}]
+                )
+                response_text = response.choices[0].message.content.strip()
                 
                 # Clean up the response text to ensure valid JSON
                 if '```json' in response_text:
