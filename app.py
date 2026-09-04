@@ -421,6 +421,10 @@ async def get_documents():
     try:
         records = doc_api.search("")
         processed_records = process_neo4j_results(records)
+        # Frontend likely expects 'id' instead of 'document_id'
+        for record in processed_records:
+            if "document_id" in record:
+                record["id"] = record["document_id"]
         return JSONResponse(content=processed_records)
     except Exception as e:
         logger.error(f"Error retrieving documents: {str(e)}")
@@ -429,6 +433,35 @@ async def get_documents():
             content={"error": str(e)}
         )
 
+@app.get("/posoapi/document-info/{id}")
+async def get_document_info(id: str):
+    try:
+        document = doc_api.get_document(id)
+        if "error" in document:
+            return JSONResponse(status_code=404, content=document)
+        # Ensure 'id' key exists for frontend
+        if "document_id" in document:
+            document["id"] = document["document_id"]
+        return JSONResponse(content=document)
+    except Exception as e:
+        logger.error(f"Error retrieving document info: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/posoapi/invoice-details/{id}")
+async def get_invoice_details(id: str):
+    try:
+        document = doc_api.get_document(id)
+        if "error" in document:
+            return JSONResponse(status_code=404, content=document)
+        
+        # Return the line items and maybe total amounts for the invoice details
+        return JSONResponse(content={
+            "items": document.get("line_items", []),
+            "total_amount": document.get("total_amount")
+        })
+    except Exception as e:
+        logger.error(f"Error retrieving invoice details: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/posoapi/schema")
 async def get_database_schema(driver: GraphDatabase.driver = Depends(get_neo4j_driver)):
