@@ -413,6 +413,22 @@ def generate_fallback_query(query, schema):
     LIMIT 20
     """
 
+@app.get("/posoapi/documents")
+async def get_documents():
+    """
+    Get all processed documents from the Neo4j database
+    """
+    try:
+        records = doc_api.search("")
+        processed_records = process_neo4j_results(records)
+        return JSONResponse(content=processed_records)
+    except Exception as e:
+        logger.error(f"Error retrieving documents: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
 
 @app.get("/posoapi/schema")
 async def get_database_schema(driver: GraphDatabase.driver = Depends(get_neo4j_driver)):
